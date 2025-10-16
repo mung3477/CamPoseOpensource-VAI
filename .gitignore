@@ -1,0 +1,5 @@
+wandb/
+hf_weights/
+**/checkpoints/
+**/__pycache__/
+**/demos/
