@@ -267,7 +267,8 @@ if __name__ == '__main__':
     # SmolVLA finetuning flags
     parser.add_argument('--freeze_vision_encoder', type=str2bool, default=False, help='freeze the vision encoder (SigLIP)')
     parser.add_argument('--train_expert_only', type=str2bool, default=False, help='train only the action expert; freeze VLM')
-
+    parser.add_argument('--wandb_project_name', type=str, default='DynamicVLA', help='wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
@@ -303,5 +304,5 @@ if __name__ == '__main__':
         main(args, ckpt)
     else:
         print(f"Starting new training run: {args.name}")
-        wandb.init(project='test', name=args.name, config=vars(args), group=group)
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, name=args.name, config=vars(args), group=group)
         main(args)

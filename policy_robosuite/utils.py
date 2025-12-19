@@ -439,6 +439,7 @@ class EpisodicDataset(Dataset):
 # --- Data Loading Function ---
 
 def load_data(args, env, val_split=0.1):
+    import pdb; pdb.set_trace()
     with h5py.File(args.dataset_path, 'r') as f:
         available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
 
