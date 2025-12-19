@@ -30,7 +30,7 @@ def compute_dict_mean(dict_list):
     """Compute the mean value for each key in a list of dictionaries."""
     if len(dict_list) == 0:
         return {}
-    
+
     mean_dict = {}
     for key in dict_list[0].keys():
         if not isinstance(dict_list[0][key], torch.Tensor):
@@ -53,15 +53,15 @@ def cleanup_ckpt(ckpt_dir, keep=1):
     ckpts = glob.glob(os.path.join(ckpt_dir, "epoch_*.pth"))
     if len(ckpts) <= keep:
         return
-    
+
     epoch_nums = []
     for ckpt in ckpts:
         match = re.search(r"epoch_(\d+).pth", ckpt)
         if match:
             epoch_nums.append((int(match.group(1)), ckpt))
-    
+
     epoch_nums.sort(reverse=True)
-    
+
     for _, ckpt in epoch_nums[keep:]:
         os.remove(ckpt)
 
@@ -69,11 +69,11 @@ def get_last_ckpt(ckpt_dir):
     """Get the latest checkpoint in the directory."""
     if not os.path.exists(ckpt_dir):
         return None
-    
+
     ckpts = glob.glob(os.path.join(ckpt_dir, "epoch_*.pth"))
     if not ckpts:
         return None
-    
+
     latest_epoch = -1
     latest_ckpt = None
     for ckpt in ckpts:
@@ -83,7 +83,7 @@ def get_last_ckpt(ckpt_dir):
             if epoch > latest_epoch:
                 latest_epoch = epoch
                 latest_ckpt = ckpt
-    
+
     return latest_ckpt
 
 def cosine_schedule(optimizer, total_steps, eta_min=0.0):
@@ -108,7 +108,7 @@ def constant_schedule(optimizer):
 def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
     """
     Compute normalization statistics for actions and states from robosuite dataset.
-    
+
     Args:
         dataset_path (str): Path to the robosuite HDF5 dataset
         num_demos (int): Number of demonstrations to use for computing stats.
@@ -117,21 +117,21 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
     """
     all_states_data = []
     all_action_data = []
-    
+
     with h5py.File(dataset_path, 'r') as dataset_file:
         demo_keys = [k for k in dataset_file['data'].keys() if k.startswith('demo_')]
         num_demos_available = len(demo_keys)
         num_demos_to_use = min(num_demos, num_demos_available)
-            
+
         print(f"Computing robosuite normalization statistics using {num_demos_to_use} demonstrations from {dataset_path}...")
-        
+
         for i in range(num_demos_to_use):
             demo_key = f'demo_{i}'
-            
+
             # Load states and actions from robosuite format
             states = dataset_file[f'data/{demo_key}/states'][()].astype(np.float32)
             actions = dataset_file[f'data/{demo_key}/actions'][()].astype(np.float32)
-            
+
             # Extract only robot joint positions (first 7 dimensions)
             robot_qpos = states[:, :7]  # Robot joint positions
 
@@ -188,7 +188,7 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
         "action_mean": action_mean,
         "action_std": action_std,
     }
-    
+
     print(f"State Mean shape: {stats['state_mean'].shape}, Action Mean shape: {stats['action_mean'].shape}")
     return stats
 
@@ -199,11 +199,11 @@ class RGBJitter(object):
     def __init__(self, brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1):
         self.rgb_jitter = T.ColorJitter(
             brightness=brightness,
-            contrast=contrast, 
-            saturation=saturation, 
+            contrast=contrast,
+            saturation=saturation,
             hue=hue
         )
-    
+
     def __call__(self, img):
         assert img.dim() == 3
         img[:3] = self.rgb_jitter(img[:3])
@@ -264,36 +264,36 @@ class EpisodicDataset(Dataset):
         self.image_size = 256  # Standard image size
         self.use_plucker = args.use_plucker
         self.num_cameras = args.num_side_cam
-        
+
         if not self.args.default_cam:
             poses_path = os.path.join(self.args.camera_poses_dir, camera_poses_file)
             with open(poses_path, 'r') as f:
                 raw = json.load(f)
             self.camera_poses = raw['poses']
-            
+
             print(f"Loaded {len(self.camera_poses)} camera poses (old format) from {poses_path}; num_side_cam={self.num_cameras}")
         else:
             # self.camera_poses = None
             print("Using default agentview camera pose (duplicated if multiple cams)")
-        
+
         if self.use_plucker:
             self.plucker_embedder = PluckerEmbedder(img_size=self.image_size, device='cuda')
         else:
             self.plucker_embedder = None
-        
+
         # Load demonstration data
         self.demo_states = []
         self.demo_actions = []
         self.demo_lengths = []
-        
+
         print(f"Loading robosuite data for {len(demo_indices)} demos from {args.dataset_path}...")
         with h5py.File(args.dataset_path, "r") as dataset_file:
             for idx in self.demo_indices:
                 demo_key = f'demo_{idx}'
-                
+
                 states = dataset_file[f'data/{demo_key}/states'][()].astype(np.float32)
                 actions = dataset_file[f'data/{demo_key}/actions'][()].astype(np.float32)
-                
+
                 self.demo_states.append(states)
                 self.demo_actions.append(actions)
                 demo_len = len(actions)
@@ -320,37 +320,37 @@ class EpisodicDataset(Dataset):
             ])
         else:
             raise ValueError("Invalid transform type. Choose 'id', 'crop', 'jitter', or 'crop_jitter'.")
-            
+
     def __len__(self):
         return len(self.demo_indices)
-    
+
     def _get_camera_intrinsics(self):
         cam_name = "agentview"  # assume same intrinsics
         cam_id = self.env.sim.model.camera_name2id(cam_name)
-        
+
         fovy = self.env.sim.model.cam_fovy[cam_id] * np.pi / 180.0
         width, height = self.image_size, self.image_size
-        
+
         focal_length = height / (2 * np.tan(fovy / 2))
-        
+
         intrinsics = np.array([
             [focal_length, 0, width / 2],
             [0, focal_length, height / 2],
             [0, 0, 1]
         ], dtype=np.float32)
-        
+
         return intrinsics
-    
+
     def _set_camera_pose(self, cam_to_world):
         cam_name = "agentview"
         cam_id = self.env.sim.model.camera_name2id(cam_name)
-        
+
         self.env.sim.model.cam_pos[cam_id] = cam_to_world[:3, 3]
         rotation = Rotation.from_matrix(cam_to_world[:3, :3])
         quat = rotation.as_quat()  # [x, y, z, w]
 
         self.env.sim.model.cam_quat[cam_id] = [quat[3], quat[0], quat[1], quat[2]]
-    
+
     def __getitem__(self, demo_idx):
         demo_length = self.demo_lengths[demo_idx]
         states = self.demo_states[demo_idx]
@@ -387,13 +387,13 @@ class EpisodicDataset(Dataset):
                     plucker_tensor = einops.rearrange(plucker_data['plucker'][0], 'h w c -> c h w')
             else:
                 plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2], device='cuda')
-                
+
             img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
             cam_images.append(self.transforms(img_chw))
 
         # Stack per-camera images: [num_cameras, C, H, W]
         image_tensor = torch.stack(cam_images, dim=0)
-        
+
         # Camera extrinsics tokens: always 2 entries [2, 4, 4]
         if self.args.use_cam_pose and not self.args.default_cam:
             cam_extrinsics_list = []
@@ -406,26 +406,26 @@ class EpisodicDataset(Dataset):
             cam_extrinsics = torch.stack(cam_extrinsics_list, dim=0)
         else:
             cam_extrinsics = torch.zeros(2, 4, 4, device='cuda')
-        
+
         # Normalize and convert to tensors
         robot_qpos = states[start_ts][:7]
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
         actions_seq = actions[start_ts:]
-        
+
         padded_actions = np.zeros((self.max_seq_length, actions.shape[1]), dtype=np.float32)
         seq_length = min(len(actions_seq), self.max_seq_length)
         padded_actions[:seq_length] = actions_seq[:seq_length]
-        
+
         is_pad = np.zeros(self.max_seq_length, dtype=np.bool_)
         is_pad[seq_length:] = True
-        
+
         state_normalized = (robot_qpos - self.norm_stats["state_mean"]) / self.norm_stats["state_std"]
         actions_normalized = (padded_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
-        
+
         return {
             'image': image_tensor,
-            'qpos': torch.from_numpy(state_normalized).float().cuda(), 
+            'qpos': torch.from_numpy(state_normalized).float().cuda(),
             'actions': torch.from_numpy(actions_normalized).float().cuda(),
             'is_pad': torch.from_numpy(is_pad).cuda(),
             'cam_extrinsics': cam_extrinsics
@@ -439,7 +439,6 @@ class EpisodicDataset(Dataset):
 # --- Data Loading Function ---
 
 def load_data(args, env, val_split=0.1):
-    import pdb; pdb.set_trace()
     with h5py.File(args.dataset_path, 'r') as f:
         available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
 
@@ -447,25 +446,25 @@ def load_data(args, env, val_split=0.1):
 
     train_indices = list(range(args.num_episodes))
     val_indices = list(range(args.num_episodes, args.num_episodes + 10))
-    
+
     print("Computing normalization statistics...")
     # Choose normalization style based on policy_class (dp -> min-max-as-mean/std)
     norm_stats = get_norm_stats(args.dataset_path, num_demos=args.num_episodes, policy_class=args.policy_class)
     print("Normalization statistics computed.")
-    
+
     print("Loading training dataset...")
     train_dataset = EpisodicDataset(
-        train_indices, 
-        norm_stats, 
+        train_indices,
+        norm_stats,
         args,
         camera_poses_file=args.train_poses_file,
         transform=args.transform,
         env=env
     )
-    
+
     print("Loading validation dataset...")
     val_dataset = EpisodicDataset(
-        val_indices, 
+        val_indices,
         norm_stats,
         args,
         camera_poses_file=args.test_poses_file,
@@ -473,7 +472,7 @@ def load_data(args, env, val_split=0.1):
         env=env
     )
     print("Datasets loaded.")
-    
+
     max_seq_length = train_dataset.max_seq_length
     print(f"Using max sequence length: {max_seq_length}")
 
@@ -481,19 +480,19 @@ def load_data(args, env, val_split=0.1):
     val_dataset.max_seq_length = max_seq_length
 
     train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
         num_workers=0,  # Disable multiprocessing due to robosuite environment
         pin_memory=False
     )
-    
+
     val_dataloader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=0,
         pin_memory=False
     )
-    
+
     return train_dataloader, val_dataloader, norm_stats
