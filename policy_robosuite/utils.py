@@ -634,7 +634,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
-            'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
+            'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).bfloat16().cuda(),
             'cam_extrinsics': cam_extrinsics
         }
 

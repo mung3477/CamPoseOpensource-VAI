@@ -16,11 +16,95 @@ from models.act import ACTPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
+from unimatch.unimatch import UniMatch, UniMatchFlowWDepth
+import einops
 
 import wandb
 
 torch.backends.cuda.enable_flash_sdp(True)
 print(torch.backends.cuda.is_flash_attention_available())
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---------- utils: 6D rotation -> rotation matrix (Zhou et al.) ----------
+def rot6d_to_matrix(x6: torch.Tensor) -> torch.Tensor:
+    """
+    x6: (B, 6)
+    return: (B, 3, 3) rotation matrices
+    """
+    a1 = x6[:, 0:3]
+    a2 = x6[:, 3:6]
+
+    b1 = F.normalize(a1, dim=-1)
+    # make a2 orthogonal to b1
+    a2_ortho = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = F.normalize(a2_ortho, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+
+    R = torch.stack([b1, b2, b3], dim=-1)  # (B, 3, 3) columns
+    return R
+
+def geodesic_rot_loss(R_pred: torch.Tensor, R_gt: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    R_pred, R_gt: (B, 3, 3)
+    returns mean angle (radians)
+    """
+    # relative rotation
+    R_rel = torch.matmul(R_gt.transpose(-1, -2), R_pred)
+    trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2]
+    cos_theta = (trace - 1.0) * 0.5
+    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+    theta = torch.acos(cos_theta)  # (B,)
+    return theta.mean()
+
+def make_T(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """
+    R: (B,3,3), t: (B,3)
+    return: (B,4,4)
+    """
+    B = R.shape[0]
+    T = torch.eye(4, device=R.device, dtype=R.dtype).unsqueeze(0).repeat(B, 1, 1)
+    T[:, :3, :3] = R
+    T[:, :3, 3] = t
+    return T
+
+optical_backbone_cfg = {
+    "feature_channels":128,
+    "num_scales":2,
+    "upsample_factor":4,
+    "num_head":1,
+    "ffn_dim_expansion":4,
+    "num_transformer_layers":6,
+    "reg_refine":True,
+    "task":'flow',
+    "resume_train": "unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth",
+    "strict_resume": False,
+}
+
+def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None):
+    #define optical backbone class
+    optical_backbone = UniMatch(feature_channels=optical_backbone_cfg["feature_channels"],
+                    num_scales=optical_backbone_cfg["num_scales"],
+                    upsample_factor=optical_backbone_cfg["upsample_factor"],
+                    num_head=optical_backbone_cfg["num_head"],
+                    ffn_dim_expansion=optical_backbone_cfg["ffn_dim_expansion"],
+                    num_transformer_layers=optical_backbone_cfg["num_transformer_layers"],
+                    reg_refine=optical_backbone_cfg["reg_refine"],
+                    task=optical_backbone_cfg["task"],
+                    ).to(device)
+    optical_backbone_cfg["resume"] = optical_backbone_cfg["resume_train"]
+    if optical_backbone_cfg["resume"]:
+        print('Load Flow checkpoint: %s' % optical_backbone_cfg["resume"])
+        optical_checkpoint = torch.load(optical_backbone_cfg["resume"])
+        optical_backbone.load_state_dict(optical_checkpoint['model'], strict=optical_backbone_cfg["strict_resume"])
+    
+    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path)
+    #backbone_projector_model = UniMatchVisionBackbone(base_unimatch=backbone_model, fuse_multiscale=False, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob)
+    return backbone_projector_model
+
 
 def main(args, ckpt=None):
     set_seed(args.seed)
@@ -55,38 +139,39 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    train_dataloader, val_dataloader, stats = load_implicit_extrinsic_data(
-        args=args,
-        env=env
-    )
-
     # Save stats
     os.makedirs(args.ckpt_dir, exist_ok=True)
     stats_path = os.path.join(args.ckpt_dir, 'dataset_stats.json')
     with open(stats_path, 'w') as f:
         json.dump({k: v.tolist() for k, v in stats.items()}, f, indent=4)
 
-    evaluator = Evaluator(env=env, norm_stats=stats, dataset_path=args.dataset_path, args=args)
+    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path).to(torch.device("cuda"))
+    lr = getattr(args, "lr", 3e-4)
+    wd = getattr(args, "weight_decay", 1e-4)
+    optimizer = torch.optim.AdamW(implicit_extrinsic_backbone.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95))
 
-    if args.policy_class == 'act':
-        policy = ACTPolicy(args).cuda()
-    elif args.policy_class == 'dp':
-        policy = DiffusionPolicy(args).cuda()
-    elif args.policy_class == 'smolvla':
-        policy = SmolVLAPolicyWrapper(args).cuda()
-    
-    optimizer = policy.configure_optimizers()
-    if args.policy_class == 'smolvla':
-        steps_per_epoch = len(train_dataloader)
-        total_steps = args.num_epochs * steps_per_epoch
-        scheduler = cosine_schedule_with_warmup(optimizer, 0.05 * total_steps, total_steps)
-    else:
-        scheduler = constant_schedule(optimizer)
-    
-    
+    train_dataloader, val_dataloader, stats = load_implicit_extrinsic_data(
+        args=args,
+        env=env,
+        preprocess_model=implicit_extrinsic_backbone
+    )
+    # ---- scheduler (warmup + cosine) ----
+    total_steps = args.num_epochs * len(train_dataloader)
+    warmup_steps = int(getattr(args, "warmup_ratio", 0.05) * total_steps)
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        # cosine decay to min_lr_ratio
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        min_lr_ratio = getattr(args, "min_lr_ratio", 0.1)  # end at 10% of lr
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)    
     epoch = 0
     if ckpt is not None:
-        policy.load_state_dict(ckpt['model_state_dict'])
+        implicit_extrinsic_backbone.load_state_dict(ckpt['model_state_dict'])
         if 'optimizer_state_dict' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if 'scheduler_state_dict' in ckpt:
@@ -96,22 +181,52 @@ def main(args, ckpt=None):
     
     pbar = tqdm.tqdm(total=args.num_epochs, desc="Training")
     pbar.update(epoch)
-    
     while epoch < args.num_epochs:
         
         # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
         if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
             print("⚠️  Render fault detected; rebuilding context")
             env.reset()
-
         # Validation
         if epoch % 10 == 0:
             with torch.inference_mode():
-                policy.eval()
+                implicit_extrinsic_backbone.eval()
                 epoch_dicts = []
                 for data in val_dataloader:
                     with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                        forward_dict = policy(data)
+                        img1 = data['image']
+                        img2 = data['future_image']
+                        action = data['dynamic_actions_normalized']
+                        gt_extrinsic = data['cam_extrinsics'][:, 0]
+
+                        img1 = einops.rearrange(img1, "b s n ... -> s b n ...")
+                        action = einops.rearrange(action, "b s n ... -> s b n ...")
+                        img2 = einops.rearrange(img2, "b s n ... -> s b n ...")
+
+                        flat_img1 = einops.rearrange(img1, "s b c h w -> (s b) c h w")
+                        flat_action = einops.rearrange(action, "s b a -> (s b) a")
+                        flat_img2 = einops.rearrange(img2, "s b c h w -> (s b) c h w")
+
+                        img1_224 = F.interpolate(flat_img1, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+                        img2_224 = F.interpolate(flat_img2, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+                        preds = implicit_extrinsic_backbone(img1_224, img2_224, action=flat_action)
+                        t_pred = preds[:, 0:3]             # (B,3)
+                        r6_pred = preds[:, 3:9]            # (B,6)
+                        R_pred = rot6d_to_matrix(r6_pred)
+                        R_gt = gt_extrinsic[:, :3, :3]
+                        t_gt = gt_extrinsic[:, :3, 3]
+                        loss_t = F.smooth_l1_loss(t_pred, t_gt)
+                        loss_R = geodesic_rot_loss(R_pred, R_gt)
+                        loss = loss_t + loss_R
+                        rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
+                        trans_err = (t_pred.detach() - t_gt.detach()).norm(dim=-1).mean()
+                        forward_dict = {
+                            "loss": loss,
+                            "loss_t": loss_t.detach(),
+                            "loss_R_rad": loss_R.detach(),
+                            "rot_err_deg": rot_err_deg,
+                            "trans_err": trans_err,
+                        }
                     epoch_dicts.append(forward_dict)
                 epoch_summary = compute_dict_mean(epoch_dicts)
                 for k, v in epoch_summary.items():
@@ -122,7 +237,7 @@ def main(args, ckpt=None):
             checkpoint_path = os.path.join(args.ckpt_dir, f'epoch_{epoch}.pth')
             torch.save({
                 'epoch': epoch, 
-                'model_state_dict': policy.state_dict(),
+                'model_state_dict': implicit_extrinsic_backbone.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': epoch_summary['loss'], 
@@ -141,15 +256,45 @@ def main(args, ckpt=None):
 
         # Training
         train_history = []
-        policy.train()
+        implicit_extrinsic_backbone.train()
         for data in train_dataloader:
 
             with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                forward_dict = policy(data)
-                loss = forward_dict['loss']
-            
+                img1 = data['image']
+                img2 = data['future_image']
+                action = data['dynamic_actions_normalized']
+                gt_extrinsic = data['cam_extrinsics'][:, 0]
+
+                img1 = einops.rearrange(img1, "b s n ... -> s b n ...")
+                action = einops.rearrange(action, "b s n ... -> s b n ...")
+                img2 = einops.rearrange(img2, "b s n ... -> s b n ...")
+
+                flat_img1 = einops.rearrange(img1, "s b c h w -> (s b) c h w")
+                flat_action = einops.rearrange(action, "s b a -> (s b) a")
+                flat_img2 = einops.rearrange(img2, "s b c h w -> (s b) c h w")
+
+                img1_224 = F.interpolate(flat_img1, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+                img2_224 = F.interpolate(flat_img2, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+                preds = implicit_extrinsic_backbone(img1_224, img2_224, action=flat_action)
+                t_pred = preds[:, 0:3]             # (B,3)
+                r6_pred = preds[:, 3:9]            # (B,6)
+                R_pred = rot6d_to_matrix(r6_pred)
+                R_gt = gt_extrinsic[:, :3, :3]
+                t_gt = gt_extrinsic[:, :3, 3]
+                loss_t = F.smooth_l1_loss(t_pred, t_gt)
+                loss_R = geodesic_rot_loss(R_pred, R_gt)
+                loss = loss_t + loss_R
+                rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
+                trans_err = (t_pred.detach() - t_gt.detach()).norm(dim=-1).mean()
+                forward_dict = {
+                    "loss": loss,
+                    "loss_t": loss_t.detach(),
+                    "loss_R_rad": loss_R.detach(),
+                    "rot_err_deg": rot_err_deg,
+                    "trans_err": trans_err,
+                }
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(implicit_extrinsic_backbone.parameters(), max_norm=1.0)
             optimizer.step()
             wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=epoch)
             optimizer.zero_grad(set_to_none=True)
@@ -247,6 +392,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--num_dynamic_feature', type=int, default=3, help='number of dynamic action features to use')
     parser.add_argument('--window_size', type=int, default=5, help='window size for temporal context')
+    parser.add_argument('--use_linear_prob', default=False, type=str2bool, help='use linear probability')
+    parser.add_argument('--load_pretrained_dynamic_model_path', type=str, default=None, help='path to pretrained dynamic model checkpoint')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
