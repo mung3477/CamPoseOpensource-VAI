@@ -444,7 +444,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
     Renders images on-the-fly with dynamic camera poses and Plucker embeddings.
     """
     def __init__(self, demo_indices, norm_stats, args, camera_poses_file=None,
-                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None, preprocess_model=None):
+                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None, preprocess_model=None, translation_normalize_extrinsic=False):
         """
         Args:
             demo_indices (list): List of demonstration indices to use
@@ -485,8 +485,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.demo_states = []
         self.demo_actions = []
         self.demo_lengths = []
-        
-        if not self.args.default_cam:
+        self.translation_normalize_extrinsic = translation_normalize_extrinsic
+
+        if not self.args.default_cam and self.translation_normalize_extrinsic:
             poses = np.asarray(self.camera_poses, dtype=np.float32)  # (N,4,4)
             t = poses[:, :3, 3]                                      # (N,3)
             t_mean = t.mean(axis=0, keepdims=True)                   # (1,3)
@@ -662,8 +663,6 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
             'cam_extrinsics': cam_extrinsics,
             "optical_flow": optical_flow,
-            't_scale': torch.tensor(self.t_scale, device='cuda', dtype=torch.float32),
-
         }
 
     def __del__(self):
@@ -759,6 +758,7 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None
         num_dynamic_feature=args.num_dynamic_feature,
         window_size=args.window_size,
         preprocess_model=preprocess_model,
+        translation_normalize_extrinsic=args.translation_normalize_extrinsic
     )
     norm_stats['train_t_scale'] = np.array([train_dataset.t_scale])
     print("Loading validation dataset...")
@@ -772,7 +772,7 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None
         num_dynamic_feature=args.num_dynamic_feature,
         window_size=args.window_size,
         preprocess_model=preprocess_model,
-
+        translation_normalize_extrinsic=args.translation_normalize_extrinsic
     )
     norm_stats['val_t_scale'] = np.array([val_dataset.t_scale])
     print("Datasets loaded.")

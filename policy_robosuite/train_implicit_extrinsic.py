@@ -146,7 +146,7 @@ def main(args, ckpt=None):
     train_dataloader, val_dataloader, stats = load_implicit_extrinsic_data(
         args=args,
         env=env,
-        preprocess_model=implicit_extrinsic_backbone
+        preprocess_model=implicit_extrinsic_backbone,
     )
     # Save stats
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -384,6 +384,7 @@ if __name__ == '__main__':
     parser.add_argument('--window_size', type=int, default=5, help='window size for temporal context')
     parser.add_argument('--use_linear_prob', default=False, type=str2bool, help='use linear probability')
     parser.add_argument('--load_pretrained_dynamic_model_path', type=str, default=None, help='path to pretrained dynamic model checkpoint')
+    parser.add_argument('--translation_normalize_extrinsic', default=False, type=str2bool, help='whether to normalize the extrinsic translation')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
