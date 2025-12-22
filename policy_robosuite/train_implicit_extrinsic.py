@@ -153,7 +153,7 @@ def main(args, ckpt=None):
     train_dataloader, val_dataloader, stats = load_implicit_extrinsic_data(
         args=args,
         env=env,
-        preprocess_model=implicit_extrinsic_backbone
+        # preprocess_model=implicit_extrinsic_backbone
     )
     # ---- scheduler (warmup + cosine) ----
     total_steps = args.num_epochs * len(train_dataloader)
