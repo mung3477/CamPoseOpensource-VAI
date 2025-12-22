@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 from cam_embedding import PluckerEmbedder
+import torch.nn.functional as F
 
 from eval import to_mp4
 
@@ -443,7 +444,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
     Renders images on-the-fly with dynamic camera poses and Plucker embeddings.
     """
     def __init__(self, demo_indices, norm_stats, args, camera_poses_file=None,
-                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None):
+                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None, preprocess_model=None):
         """
         Args:
             demo_indices (list): List of demonstration indices to use
@@ -463,6 +464,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.num_cameras = args.num_side_cam
         self.num_dynamic_feature = num_dynamic_feature
         self.window_size = window_size
+        self.preprocess_model = preprocess_model
         if not self.args.default_cam:
             poses_path = os.path.join(self.args.camera_poses_dir, camera_poses_file)
             with open(poses_path, 'r') as f:
@@ -631,11 +633,17 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         future_image_tensor = torch.stack(future_cam_images, dim=0)
         dynamic_actions = np.array(dynamic_actions)
         dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        img1_224 = F.interpolate(image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+        img2_224 = F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+        with torch.no_grad():
+            self.preprocess_model.eval()
+            optical_flow = self.preprocess_model.extract_flow(img1_224, img2_224)
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
-            'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).bfloat16().cuda(),
-            'cam_extrinsics': cam_extrinsics
+            'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
+            'cam_extrinsics': cam_extrinsics,
+            "optical_flow": optical_flow
         }
 
     def __del__(self):
@@ -706,7 +714,7 @@ def load_data(args, env, val_split=0.1):
     return train_dataloader, val_dataloader, norm_stats
 
 
-def load_implicit_extrinsic_data(args, env, val_split=0.1):
+def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None):
     with h5py.File(args.dataset_path, 'r') as f:
         available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
 
@@ -729,7 +737,8 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1):
         transform=args.transform,
         env=env,
         num_dynamic_feature=args.num_dynamic_feature,
-        window_size=args.window_size
+        window_size=args.window_size,
+        preprocess_model=preprocess_model,
     )
     
     print("Loading validation dataset...")
@@ -741,7 +750,9 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1):
         transform="id",  # Use simpler transform for validation
         env=env,
         num_dynamic_feature=args.num_dynamic_feature,
-        window_size=args.window_size
+        window_size=args.window_size,
+        preprocess_model=preprocess_model,
+
     )
     print("Datasets loaded.")
     

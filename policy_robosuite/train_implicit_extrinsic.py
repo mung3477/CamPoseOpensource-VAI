@@ -30,21 +30,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------- utils: 6D rotation -> rotation matrix (Zhou et al.) ----------
-def rot6d_to_matrix(x6: torch.Tensor) -> torch.Tensor:
-    """
-    x6: (B, 6)
-    return: (B, 3, 3) rotation matrices
-    """
+def rot6d_to_matrix(x6: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     a1 = x6[:, 0:3]
     a2 = x6[:, 3:6]
 
-    b1 = F.normalize(a1, dim=-1)
-    # make a2 orthogonal to b1
-    a2_ortho = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(a2_ortho, dim=-1)
+    b1 = F.normalize(a1, dim=-1, eps=eps)
+
+    # a2에서 b1 성분 제거
+    proj = (b1 * a2).sum(dim=-1, keepdim=True)
+    a2_ortho = a2 - proj * b1
+
+    b2 = F.normalize(a2_ortho, dim=-1, eps=eps)
     b3 = torch.cross(b1, b2, dim=-1)
 
-    R = torch.stack([b1, b2, b3], dim=-1)  # (B, 3, 3) columns
+    R = torch.stack([b1, b2, b3], dim=-1)
     return R
 
 def geodesic_rot_loss(R_pred: torch.Tensor, R_gt: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -139,12 +138,6 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    # Save stats
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    stats_path = os.path.join(args.ckpt_dir, 'dataset_stats.json')
-    with open(stats_path, 'w') as f:
-        json.dump({k: v.tolist() for k, v in stats.items()}, f, indent=4)
-
     implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path).to(torch.device("cuda"))
     lr = getattr(args, "lr", 3e-4)
     wd = getattr(args, "weight_decay", 1e-4)
@@ -153,8 +146,13 @@ def main(args, ckpt=None):
     train_dataloader, val_dataloader, stats = load_implicit_extrinsic_data(
         args=args,
         env=env,
-        # preprocess_model=implicit_extrinsic_backbone
+        preprocess_model=implicit_extrinsic_backbone
     )
+    # Save stats
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    stats_path = os.path.join(args.ckpt_dir, 'dataset_stats.json')
+    with open(stats_path, 'w') as f:
+        json.dump({k: v.tolist() for k, v in stats.items()}, f, indent=4)
     # ---- scheduler (warmup + cosine) ----
     total_steps = args.num_epochs * len(train_dataloader)
     warmup_steps = int(getattr(args, "warmup_ratio", 0.05) * total_steps)
@@ -194,29 +192,24 @@ def main(args, ckpt=None):
                 epoch_dicts = []
                 for data in val_dataloader:
                     with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                        img1 = data['image']
-                        img2 = data['future_image']
+                        optical_flow = data['optical_flow']
                         action = data['dynamic_actions_normalized']
                         gt_extrinsic = data['cam_extrinsics'][:, 0]
-
-                        img1 = einops.rearrange(img1, "b s n ... -> s b n ...")
+                        optical_flow = einops.rearrange(optical_flow, "b s n ... -> s b n ...")
                         action = einops.rearrange(action, "b s n ... -> s b n ...")
-                        img2 = einops.rearrange(img2, "b s n ... -> s b n ...")
 
-                        flat_img1 = einops.rearrange(img1, "s b c h w -> (s b) c h w")
+                        optical_flow = einops.rearrange(optical_flow, "s b c h w -> (s b) c h w")
                         flat_action = einops.rearrange(action, "s b a -> (s b) a")
-                        flat_img2 = einops.rearrange(img2, "s b c h w -> (s b) c h w")
+                        preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow)
+                        t_pred = preds[:, 0:3].float()
+                        r6_pred = preds[:, 3:9].float()
 
-                        img1_224 = F.interpolate(flat_img1, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
-                        img2_224 = F.interpolate(flat_img2, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
-                        preds = implicit_extrinsic_backbone(img1_224, img2_224, action=flat_action)
-                        t_pred = preds[:, 0:3]             # (B,3)
-                        r6_pred = preds[:, 3:9]            # (B,6)
-                        R_pred = rot6d_to_matrix(r6_pred)
-                        R_gt = gt_extrinsic[:, :3, :3]
-                        t_gt = gt_extrinsic[:, :3, 3]
+                        R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
+                        R_gt   = gt_extrinsic[:, :3, :3].float()
+                        t_gt   = gt_extrinsic[:, :3, 3].float()
+
                         loss_t = F.smooth_l1_loss(t_pred, t_gt)
-                        loss_R = geodesic_rot_loss(R_pred, R_gt)
+                        loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
                         loss = loss_t + loss_R
                         rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
                         trans_err = (t_pred.detach() - t_gt.detach()).norm(dim=-1).mean()
@@ -260,29 +253,26 @@ def main(args, ckpt=None):
         for data in train_dataloader:
 
             with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                img1 = data['image']
-                img2 = data['future_image']
+                # img1 = data['image']
+                # img2 = data['future_image']
+                optical_flow = data['optical_flow']
                 action = data['dynamic_actions_normalized']
                 gt_extrinsic = data['cam_extrinsics'][:, 0]
-
-                img1 = einops.rearrange(img1, "b s n ... -> s b n ...")
+                optical_flow = einops.rearrange(optical_flow, "b s n ... -> s b n ...")
                 action = einops.rearrange(action, "b s n ... -> s b n ...")
-                img2 = einops.rearrange(img2, "b s n ... -> s b n ...")
-
-                flat_img1 = einops.rearrange(img1, "s b c h w -> (s b) c h w")
+                optical_flow = einops.rearrange(optical_flow, "s b c h w -> (s b) c h w")
                 flat_action = einops.rearrange(action, "s b a -> (s b) a")
-                flat_img2 = einops.rearrange(img2, "s b c h w -> (s b) c h w")
+                preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow)
 
-                img1_224 = F.interpolate(flat_img1, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
-                img2_224 = F.interpolate(flat_img2, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
-                preds = implicit_extrinsic_backbone(img1_224, img2_224, action=flat_action)
-                t_pred = preds[:, 0:3]             # (B,3)
-                r6_pred = preds[:, 3:9]            # (B,6)
-                R_pred = rot6d_to_matrix(r6_pred)
-                R_gt = gt_extrinsic[:, :3, :3]
-                t_gt = gt_extrinsic[:, :3, 3]
+                t_pred = preds[:, 0:3].float()
+                r6_pred = preds[:, 3:9].float()
+
+                R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
+                R_gt   = gt_extrinsic[:, :3, :3].float()
+                t_gt   = gt_extrinsic[:, :3, 3].float()
+
                 loss_t = F.smooth_l1_loss(t_pred, t_gt)
-                loss_R = geodesic_rot_loss(R_pred, R_gt)
+                loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
                 loss = loss_t + loss_R
                 rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
                 trans_err = (t_pred.detach() - t_gt.detach()).norm(dim=-1).mean()
@@ -341,12 +331,12 @@ if __name__ == '__main__':
     parser.add_argument('--default_cam', type=str2bool, default=False, help='When true, use default agentview pose for all cameras (duplicate if >1)')
 
     # Training config
-    parser.add_argument('--batch_size', default=70, type=int, help='batch_size')
+    parser.add_argument('--batch_size', default=128, type=int, help='batch_size')
     parser.add_argument('--seed', default=0, type=int, help='seed')
-    parser.add_argument('--num_epochs', default=30_001, type=int, help='num_epochs')
+    parser.add_argument('--num_epochs', default=120, type=int, help='num_epochs')
     parser.add_argument('--eval_start_epoch', type=int, default=20_000, help='start evaluating 50 at this epoch')
     parser.add_argument('--lr', type=float, default=2e-5, help='lr')
-    parser.add_argument('--save_every', type=int, default=1000, help='save checkpoint every N epochs')
+    parser.add_argument('--save_every', type=int, default=10, help='save checkpoint every N epochs')
     parser.add_argument('--use_fp16', default=True, type=str2bool, help='use mixed precision bf16 training')
     
     # Dataloader config
