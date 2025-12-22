@@ -569,9 +569,13 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         else:
             pose_set = [None] * self.args.num_side_cam
 
+        if demo_length >= self.num_dynamic_feature:
+            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=False)
+        else:
+            start_ts_list = np.random.choice(demo_length, size=size=self.num_dynamic_feature, replace=True)
+            
         for idx in range(self.num_dynamic_feature):
-                
-            start_ts = np.random.randint(demo_length)
+            start_ts = start_ts_list[idx]
 
             self.env.sim.set_state_from_flattened(states[start_ts])
             self.env.set_init_action()

@@ -14,5 +14,5 @@ python policy_robosuite/train_implicit_extrinsic.py \
 --window_size 5 \
 --batch_size 256 \
 --seed 0 \
---num_epochs 120 \
+--num_epochs 1000 \
 --use_fp16 "0"
