@@ -572,7 +572,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         if demo_length >= self.num_dynamic_feature:
             start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=False)
         else:
-            start_ts_list = np.random.choice(demo_length, size=size=self.num_dynamic_feature, replace=True)
+            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=True)
             
         for idx in range(self.num_dynamic_feature):
             start_ts = start_ts_list[idx]
