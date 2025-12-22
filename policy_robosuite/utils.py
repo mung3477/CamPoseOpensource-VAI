@@ -486,6 +486,18 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.demo_actions = []
         self.demo_lengths = []
         
+        if not self.args.default_cam:
+            poses = np.asarray(self.camera_poses, dtype=np.float32)  # (N,4,4)
+            t = poses[:, :3, 3]                                      # (N,3)
+            t_mean = t.mean(axis=0, keepdims=True)                   # (1,3)
+            Z = np.linalg.norm(t - t_mean, axis=1).mean()            # scalar
+
+            self.t_scale = float(max(Z, 1e-6))                       # avoid /0
+            # (선택) 로그
+            print(f"[Extrinsic] translation scale Z={self.t_scale:.6f}")
+        else:
+            self.t_scale = 1.0
+
         print(f"Loading robosuite data for {len(demo_indices)} demos from {args.dataset_path}...")
         with h5py.File(args.dataset_path, "r") as dataset_file:
             for idx in self.demo_indices:
@@ -626,7 +638,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             for i in range(2):
                 if i < len(pose_set) and pose_set[i] is not None:
                     cam_pose_mat = np.array(pose_set[i], dtype=np.float32)
-                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat).float().cuda())
+                    cam_pose_mat_norm = cam_pose_mat.copy()
+                    cam_pose_mat_norm[:3, 3] /= self.t_scale
+                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat_norm).float().cuda())
                 else:
                     cam_extrinsics_list.append(torch.zeros(4, 4, device='cuda'))
             cam_extrinsics = torch.stack(cam_extrinsics_list, dim=0)
@@ -647,7 +661,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             'future_image': future_image_tensor,
             'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
             'cam_extrinsics': cam_extrinsics,
-            "optical_flow": optical_flow
+            "optical_flow": optical_flow,
+            't_scale': torch.tensor(self.t_scale, device='cuda', dtype=torch.float32),
+
         }
 
     def __del__(self):
@@ -744,7 +760,7 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None
         window_size=args.window_size,
         preprocess_model=preprocess_model,
     )
-    
+    norm_stats['train_t_scale'] = np.array([train_dataset.t_scale])
     print("Loading validation dataset...")
     val_dataset = EpisodicImplicitExtrinsicDataset(
         val_indices, 
@@ -758,6 +774,7 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None
         preprocess_model=preprocess_model,
 
     )
+    norm_stats['val_t_scale'] = np.array([val_dataset.t_scale])
     print("Datasets loaded.")
     
     max_seq_length = train_dataset.max_seq_length

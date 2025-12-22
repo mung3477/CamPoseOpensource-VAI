@@ -201,18 +201,18 @@ def main(args, ckpt=None):
                         optical_flow = einops.rearrange(optical_flow, "s b c h w -> (s b) c h w")
                         flat_action = einops.rearrange(action, "s b a -> (s b) a")
                         preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow)
-                        t_pred = preds[:, 0:3].float()
-                        r6_pred = preds[:, 3:9].float()
+                        t_pred = preds[:, 0:3]
+                        r6_pred = preds[:, 3:9]
 
                         R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
-                        R_gt   = gt_extrinsic[:, :3, :3].float()
-                        t_gt   = gt_extrinsic[:, :3, 3].float()
+                        R_gt   = gt_extrinsic[:, :3, :3]
+                        t_gt   = gt_extrinsic[:, :3, 3]
 
                         loss_t = F.smooth_l1_loss(t_pred, t_gt)
                         loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
                         loss = loss_t + loss_R
                         rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
-                        trans_err = (t_pred.detach() - t_gt.detach()).norm(dim=-1).mean()
+                        trans_err = ((t_pred - t_gt) * stats['val_t_scale'][0]).norm(dim=-1).mean()
                         forward_dict = {
                             "loss": loss,
                             "loss_t": loss_t.detach(),
@@ -264,18 +264,18 @@ def main(args, ckpt=None):
                 flat_action = einops.rearrange(action, "s b a -> (s b) a")
                 preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow)
 
-                t_pred = preds[:, 0:3].float()
-                r6_pred = preds[:, 3:9].float()
+                t_pred = preds[:, 0:3]
+                r6_pred = preds[:, 3:9]
 
                 R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
-                R_gt   = gt_extrinsic[:, :3, :3].float()
-                t_gt   = gt_extrinsic[:, :3, 3].float()
+                R_gt   = gt_extrinsic[:, :3, :3]
+                t_gt   = gt_extrinsic[:, :3, 3]
 
                 loss_t = F.smooth_l1_loss(t_pred, t_gt)
                 loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
                 loss = loss_t + loss_R
                 rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
-                trans_err = (t_pred.detach() - t_gt.detach()).norm(dim=-1).mean()
+                trans_err = ((t_pred - t_gt) * stats['train_t_scale'][0]).norm(dim=-1).mean()
                 forward_dict = {
                     "loss": loss,
                     "loss_t": loss_t.detach(),

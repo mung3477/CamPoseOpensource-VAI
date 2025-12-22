@@ -3,8 +3,8 @@ REPO_ROOT="${SCRIPT_DIR}"
 export REPO_ROOT="${SCRIPT_DIR}"
 export PYTHONPATH="${REPO_ROOT}/unimatch:${PYTHONPATH}"
 
-python policy_robosuite/train_implicit_extrinsic.py \
---name train_implicit_extrinsic_backbone_predict_extrinsic \
+CUDA_VISIBLE_DEVICES=1 python policy_robosuite/train_implicit_extrinsic.py \
+--name train_implicit_extrinsic_backbone_predict_extrinsic_epoch1000_extrinsic_translation_normalize \
 --policy_class dp \
 --use_plucker "0" \
 --wandb_project_name know_camera_implicit_extrinsic_pretrain \
