@@ -422,7 +422,6 @@ class EpisodicDataset(Dataset):
         
         state_normalized = (robot_qpos - self.norm_stats["state_mean"]) / self.norm_stats["state_std"]
         actions_normalized = (padded_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
-        
         return {
             'image': image_tensor,
             'qpos': torch.from_numpy(state_normalized).float().cuda(), 
@@ -436,10 +435,218 @@ class EpisodicDataset(Dataset):
         if hasattr(self, 'env') and self.env is not None:
             self.env.close()
 
+
+
+class EpisodicImplicitExtrinsicDataset(Dataset):
+    """
+    Dataset for loading episodic data from robosuite demonstration files.
+    Renders images on-the-fly with dynamic camera poses and Plucker embeddings.
+    """
+    def __init__(self, demo_indices, norm_stats, args, camera_poses_file=None,
+                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None):
+        """
+        Args:
+            demo_indices (list): List of demonstration indices to use
+            norm_stats (dict): Normalization statistics for actions and states
+            args: Arguments object containing dataset_path, camera_names, use_plucker, etc.
+            camera_poses_file (str): Path to JSON file with camera poses
+            max_seq_length (int, optional): Maximum sequence length for actions
+            transform (str): Transform to apply to images - "id", "crop", "jitter", or "crop_jitter"
+            env: Pre-created robosuite environment to use for rendering
+        """
+        super().__init__()
+        self.demo_indices = demo_indices
+        self.norm_stats = norm_stats
+        self.args = args
+        self.image_size = 256  # Standard image size
+        self.use_plucker = args.use_plucker
+        self.num_cameras = args.num_side_cam
+        self.num_dynamic_feature = num_dynamic_feature
+        self.window_size = window_size
+        if not self.args.default_cam:
+            poses_path = os.path.join(self.args.camera_poses_dir, camera_poses_file)
+            with open(poses_path, 'r') as f:
+                raw = json.load(f)
+            self.camera_poses = raw['poses']
+            
+            print(f"Loaded {len(self.camera_poses)} camera poses (old format) from {poses_path}; num_side_cam={self.num_cameras}")
+        else:
+            # self.camera_poses = None
+            print("Using default agentview camera pose (duplicated if multiple cams)")
+        
+        if self.use_plucker:
+            self.plucker_embedder = PluckerEmbedder(img_size=self.image_size, device='cuda')
+        else:
+            self.plucker_embedder = None
+        
+        # Load demonstration data
+        self.demo_states = []
+        self.demo_actions = []
+        self.demo_lengths = []
+        
+        print(f"Loading robosuite data for {len(demo_indices)} demos from {args.dataset_path}...")
+        with h5py.File(args.dataset_path, "r") as dataset_file:
+            for idx in self.demo_indices:
+                demo_key = f'demo_{idx}'
+                
+                states = dataset_file[f'data/{demo_key}/states'][()].astype(np.float32)
+                actions = dataset_file[f'data/{demo_key}/actions'][()].astype(np.float32)
+                
+                self.demo_states.append(states)
+                self.demo_actions.append(actions)
+                demo_len = len(actions)
+                self.demo_lengths.append(demo_len)
+
+        print(f"Successfully loaded {len(self.demo_indices)} robosuite demonstrations.")
+
+        self.env = env
+
+        if max_seq_length is None:
+            self.max_seq_length = max(self.demo_lengths)
+        else:
+            self.max_seq_length = max_seq_length
+
+        # Set up image transforms
+        if transform == "id":
+            self.transforms = T.Resize(self.image_size)
+        elif transform == "crop":
+            self.transforms = RandomCrop(min_side=int(self.image_size*0.8), max_side=self.image_size, output_size=self.image_size)
+        elif transform == "crop_jitter":
+            self.transforms = T.Compose([
+                RandomCrop(min_side=int(self.image_size*0.8), max_side=self.image_size, output_size=self.image_size),
+                RGBJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+            ])
+        else:
+            raise ValueError("Invalid transform type. Choose 'id', 'crop', 'jitter', or 'crop_jitter'.")
+            
+    def __len__(self):
+        return len(self.demo_indices)
+    
+    def _get_camera_intrinsics(self):
+        cam_name = "agentview"  # assume same intrinsics
+        cam_id = self.env.sim.model.camera_name2id(cam_name)
+        
+        fovy = self.env.sim.model.cam_fovy[cam_id] * np.pi / 180.0
+        width, height = self.image_size, self.image_size
+        
+        focal_length = height / (2 * np.tan(fovy / 2))
+        
+        intrinsics = np.array([
+            [focal_length, 0, width / 2],
+            [0, focal_length, height / 2],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        return intrinsics
+    
+    def _set_camera_pose(self, cam_to_world):
+        cam_name = "agentview"
+        cam_id = self.env.sim.model.camera_name2id(cam_name)
+        
+        self.env.sim.model.cam_pos[cam_id] = cam_to_world[:3, 3]
+        rotation = Rotation.from_matrix(cam_to_world[:3, :3])
+        quat = rotation.as_quat()  # [x, y, z, w]
+
+        self.env.sim.model.cam_quat[cam_id] = [quat[3], quat[0], quat[1], quat[2]]
+    
+    def __getitem__(self, demo_idx):
+        demo_length = self.demo_lengths[demo_idx]
+        states = self.demo_states[demo_idx]
+        actions = self.demo_actions[demo_idx]
+        cam_images = []
+        future_cam_images = []
+        dynamic_actions = []
+        cam_extrinsic_list = []
+
+        if not self.args.default_cam:
+            start = self.args.m * demo_idx
+            end = start + self.args.n
+            window = np.arange(start, end, dtype=np.int64)
+            chosen = np.random.choice(window, size=self.args.num_side_cam, replace=False)
+            pose_set = [self.camera_poses[i] for i in chosen.tolist()]
+        else:
+            pose_set = [None] * self.args.num_side_cam
+
+        for idx in range(self.num_dynamic_feature):
+                
+            start_ts = np.random.randint(demo_length)
+
+            self.env.sim.set_state_from_flattened(states[start_ts])
+            self.env.set_init_action()
+            dynamic_action = actions[start_ts]
+            
+            for cam_pose_raw in pose_set:
+                if not self.args.default_cam:
+                    cam_pose = np.array(cam_pose_raw)
+                    self._set_camera_pose(cam_pose)
+                self.env.sim.forward()
+                rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
+                rgb_img = np.flipud(rgb_img).copy()
+                rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
+
+                if self.use_plucker and not self.args.default_cam:
+                    intrinsics = self._get_camera_intrinsics()
+                    intrinsics_tensor = torch.from_numpy(intrinsics).unsqueeze(0).float().cuda()
+                    cam_to_world_tensor = torch.from_numpy(cam_pose).unsqueeze(0).float().cuda()
+                    with torch.no_grad():
+                        plucker_data = self.plucker_embedder(intrinsics_tensor, cam_to_world_tensor)
+                        plucker_tensor = einops.rearrange(plucker_data['plucker'][0], 'h w c -> c h w')
+                    img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
+                else:
+                    img_chw = rgb_tensor
+                
+                for j in range(self.window_size):
+                    self.env.step(dynamic_action)
+
+                self.env.sim.forward()
+                future_rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
+                future_rgb_img = np.flipud(future_rgb_img).copy()
+                future_rgb_tensor = einops.rearrange(torch.from_numpy(future_rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
+
+                if self.use_plucker and not self.args.default_cam:
+                    future_img_chw = torch.cat([future_rgb_tensor, plucker_tensor], dim=0)
+                else:
+                    future_img_chw = future_rgb_tensor
+
+                cam_images.append(img_chw)
+                future_cam_images.append(future_img_chw)
+
+            # Stack per-camera images: [num_cameras, C, H, W]
+            dynamic_actions.append(dynamic_action)
+            # Camera extrinsics tokens: always 2 entries [2, 4, 4]
+
+        if self.args.use_cam_pose and not self.args.default_cam:
+            cam_extrinsics_list = []
+            for i in range(2):
+                if i < len(pose_set) and pose_set[i] is not None:
+                    cam_pose_mat = np.array(pose_set[i], dtype=np.float32)
+                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat).float().cuda())
+                else:
+                    cam_extrinsics_list.append(torch.zeros(4, 4, device='cuda'))
+            cam_extrinsics = torch.stack(cam_extrinsics_list, dim=0)
+        else:
+            cam_extrinsics = torch.zeros(2, 4, 4, device='cuda')
+
+        image_tensor = torch.stack(cam_images, dim=0)
+        future_image_tensor = torch.stack(future_cam_images, dim=0)
+        dynamic_actions = np.array(dynamic_actions)
+        dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        return {
+            'image': image_tensor,
+            'future_image': future_image_tensor,
+            'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
+            'cam_extrinsics': cam_extrinsics
+        }
+
+    def __del__(self):
+        """Close the environment when the dataset is destroyed."""
+        if hasattr(self, 'env') and self.env is not None:
+            self.env.close()
+
+
 # --- Data Loading Function ---
 
 def load_data(args, env, val_split=0.1):
-    import pdb; pdb.set_trace()
     with h5py.File(args.dataset_path, 'r') as f:
         available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
 
@@ -471,6 +678,70 @@ def load_data(args, env, val_split=0.1):
         camera_poses_file=args.test_poses_file,
         transform="id",  # Use simpler transform for validation
         env=env
+    )
+    print("Datasets loaded.")
+    
+    max_seq_length = train_dataset.max_seq_length
+    print(f"Using max sequence length: {max_seq_length}")
+
+    train_dataset.max_seq_length = max_seq_length
+    val_dataset.max_seq_length = max_seq_length
+
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=0,  # Disable multiprocessing due to robosuite environment
+        pin_memory=False
+    )
+    
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=False
+    )
+    
+    return train_dataloader, val_dataloader, norm_stats
+
+
+def load_implicit_extrinsic_data(args, env, val_split=0.1):
+    with h5py.File(args.dataset_path, 'r') as f:
+        available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
+
+    assert args.num_episodes + 10 <= available_demos, "Not enough demos to split"
+
+    train_indices = list(range(args.num_episodes))
+    val_indices = list(range(args.num_episodes, args.num_episodes + 10))
+    
+    print("Computing normalization statistics...")
+    # Choose normalization style based on policy_class (dp -> min-max-as-mean/std)
+    norm_stats = get_norm_stats(args.dataset_path, num_demos=args.num_episodes, policy_class=args.policy_class)
+    print("Normalization statistics computed.")
+    
+    print("Loading training dataset...")
+    train_dataset = EpisodicImplicitExtrinsicDataset(
+        train_indices, 
+        norm_stats, 
+        args,
+        camera_poses_file=args.train_poses_file,
+        transform=args.transform,
+        env=env,
+        num_dynamic_feature=args.num_dynamic_feature,
+        window_size=args.window_size
+    )
+    
+    print("Loading validation dataset...")
+    val_dataset = EpisodicImplicitExtrinsicDataset(
+        val_indices, 
+        norm_stats,
+        args,
+        camera_poses_file=args.test_poses_file,
+        transform="id",  # Use simpler transform for validation
+        env=env,
+        num_dynamic_feature=args.num_dynamic_feature,
+        window_size=args.window_size
     )
     print("Datasets loaded.")
     

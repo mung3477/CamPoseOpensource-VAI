@@ -11,7 +11,7 @@ from contextlib import nullcontext
 import h5py
 from pathlib import Path
 
-from utils import load_data, compute_dict_mean, set_seed, detach_dict, constant_schedule, cleanup_ckpt, get_last_ckpt, cosine_schedule_with_warmup
+from utils import load_data, load_implicit_extrinsic_data, compute_dict_mean, set_seed, detach_dict, constant_schedule, cleanup_ckpt, get_last_ckpt, cosine_schedule_with_warmup
 from models.act import ACTPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
@@ -55,7 +55,7 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    train_dataloader, val_dataloader, stats = load_data(
+    train_dataloader, val_dataloader, stats = load_implicit_extrinsic_data(
         args=args,
         env=env
     )
@@ -116,32 +116,6 @@ def main(args, ckpt=None):
                 epoch_summary = compute_dict_mean(epoch_dicts)
                 for k, v in epoch_summary.items():
                     wandb.log({f'val_{k}': v.item()}, step=epoch)
-
-        # Evaluation
-        if epoch % args.eval_every == 0:
-            policy.eval()
-            for pose_file in args.pose_files:
-                pose_name = pose_file[:-5]  # Remove .json extension
-                eval_save_path = os.path.join(args.ckpt_dir, f"eval_epoch_{epoch}_{pose_name}")
-                os.makedirs(eval_save_path, exist_ok=True)
-                evaluator.success_by_seed = {}
-            
-                success_rates = []
-                for episode_idx in range(50 if epoch > args.eval_start_epoch else args.eval_episodes):
-                    with torch.no_grad():
-                        _, success_rate, _ = evaluator.evaluate(
-                            policy=policy, 
-                            save_path=eval_save_path,
-                            video_prefix=f"epoch_{epoch}_episode_{episode_idx}", 
-                            pose_name=pose_name, 
-                            episode_num=episode_idx
-                        )
-                    success_rates.append(success_rate)
-                avg_success_rate = sum(success_rates) / len(success_rates)
-                wandb.log({f'success_rate_{pose_name}': avg_success_rate}, step=epoch)
-        
-                with open(os.path.join(eval_save_path, 'success_by_seed.json'), 'w') as f:
-                    json.dump(evaluator.success_by_seed, f, indent=2)
 
         # Save checkpoint
         if epoch % args.save_every == 0:
@@ -270,6 +244,9 @@ if __name__ == '__main__':
     parser.add_argument('--train_expert_only', type=str2bool, default=False, help='train only the action expert; freeze VLM')
     parser.add_argument('--wandb_project_name', type=str, default='DynamicVLA', help='wandb project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity')
+
+    parser.add_argument('--num_dynamic_feature', type=int, default=3, help='number of dynamic action features to use')
+    parser.add_argument('--window_size', type=int, default=5, help='window size for temporal context')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
