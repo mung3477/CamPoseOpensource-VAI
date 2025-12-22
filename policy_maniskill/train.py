@@ -151,9 +151,11 @@ def main(args, ckpt=None):
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
-            if time.time() - start_time > 7.5 * 60 * 60:
-                print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
-                break
+            # No Timeout
+            # if time.time() - start_time > 7.5 * 60 * 60:
+            #     print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
+            #     break
+
         # Training
         train_history = []
         policy.train()

@@ -156,9 +156,10 @@ def main(args, ckpt=None):
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
-            if time.time() - start_time > 7.5 * 60 * 60:
-                print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
-                break
+            # No Timeout
+            # if time.time() - start_time > 7.5 * 60 * 60:
+            #     print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
+            #     break
 
         # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
         if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
