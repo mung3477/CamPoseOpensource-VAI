@@ -13,11 +13,25 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 from cam_embedding import PluckerEmbedder
+import torch.nn.functional as F
+from Depth_Anything_V2.depth_anything_v2.dpt import DepthAnythingV2
 
 from eval import to_mp4
 
 # --- Utility Functions ---
 
+from torchvision.utils import save_image
+
+def save_depth_gray(depth_b1hw: torch.Tensor, path: str):
+    d = depth_b1hw.detach().float().cpu()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    d0 = d[0]  # (1,H,W)
+    dmin = d0.min()
+    dmax = d0.max()
+    d0n = (d0 - dmin) / (dmax - dmin + 1e-6)
+
+    save_image(d0n, path)
 def set_seed(seed):
     """Set seed for reproducibility."""
     random.seed(seed)
@@ -444,7 +458,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
     Renders images on-the-fly with dynamic camera poses and Plucker embeddings.
     """
     def __init__(self, demo_indices, norm_stats, args, camera_poses_file=None,
-                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None):
+                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None, preprocess_model=None, translation_normalize_extrinsic=False):
         """
         Args:
             demo_indices (list): List of demonstration indices to use
@@ -464,6 +478,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.num_cameras = args.num_side_cam
         self.num_dynamic_feature = num_dynamic_feature
         self.window_size = window_size
+        self.preprocess_model = preprocess_model
         if not self.args.default_cam:
             poses_path = os.path.join(self.args.camera_poses_dir, camera_poses_file)
             with open(poses_path, 'r') as f:
@@ -484,6 +499,19 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.demo_states = []
         self.demo_actions = []
         self.demo_lengths = []
+        self.translation_normalize_extrinsic = translation_normalize_extrinsic
+
+        if not self.args.default_cam and self.translation_normalize_extrinsic:
+            poses = np.asarray(self.camera_poses, dtype=np.float32)  # (N,4,4)
+            t = poses[:, :3, 3]                                      # (N,3)
+            t_mean = t.mean(axis=0, keepdims=True)                   # (1,3)
+            Z = np.linalg.norm(t - t_mean, axis=1).mean()            # scalar
+
+            self.t_scale = float(max(Z, 1e-6))                       # avoid /0
+            # (선택) 로그
+            print(f"[Extrinsic] translation scale Z={self.t_scale:.6f}")
+        else:
+            self.t_scale = 1.0
 
         print(f"Loading robosuite data for {len(demo_indices)} demos from {args.dataset_path}...")
         with h5py.File(args.dataset_path, "r") as dataset_file:
@@ -519,6 +547,22 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             ])
         else:
             raise ValueError("Invalid transform type. Choose 'id', 'crop', 'jitter', or 'crop_jitter'.")
+
+        self.use_depth_model = args.use_depth_model
+        self.use_depth_sim = args.use_depth_sim
+        # error use both depth model and depth sim
+        assert not (self.use_depth_model and self.use_depth_sim), "Cannot use both depth model and depth sim simultaneously."
+        if self.use_depth_model:
+            model_configs = {
+                    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+                    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+                    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+                    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+                }
+            encoder = 'vitl'
+            self.depth_backbone = DepthAnythingV2(**model_configs[encoder])
+            self.depth_backbone.load_state_dict(torch.load(f'Depth_Anything_V2/checkpoints/depth_anything_v2_{encoder}.pth'))
+            self.depth_backbone = self.depth_backbone.to("cuda").eval()
 
     def __len__(self):
         return len(self.demo_indices)
@@ -558,7 +602,8 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         future_cam_images = []
         dynamic_actions = []
         cam_extrinsic_list = []
-
+        depth_images = []
+        future_depth_images = []
         if not self.args.default_cam:
             start = self.args.m * demo_idx
             end = start + self.args.n
@@ -568,9 +613,13 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         else:
             pose_set = [None] * self.args.num_side_cam
 
-        for idx in range(self.num_dynamic_feature):
+        if demo_length >= self.num_dynamic_feature:
+            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=False)
+        else:
+            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=True)
 
-            start_ts = np.random.randint(demo_length)
+        for idx in range(self.num_dynamic_feature):
+            start_ts = start_ts_list[idx]
 
             self.env.sim.set_state_from_flattened(states[start_ts])
             self.env.set_init_action()
@@ -581,7 +630,12 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     cam_pose = np.array(cam_pose_raw)
                     self._set_camera_pose(cam_pose)
                 self.env.sim.forward()
-                rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
+                if self.use_depth_sim:
+                    rgb_img, depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=True)
+                    depth_img = np.flipud(depth_img).copy()
+                    depth_tensor = torch.from_numpy(depth_img).unsqueeze(0).float().cuda()
+                else:
+                    rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
                 rgb_img = np.flipud(rgb_img).copy()
                 rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
 
@@ -600,7 +654,12 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     self.env.step(dynamic_action)
 
                 self.env.sim.forward()
-                future_rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
+                if self.use_depth_sim:
+                    future_rgb_img, future_depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=True)
+                    future_depth_img = np.flipud(future_depth_img).copy()
+                    future_depth_tensor = torch.from_numpy(future_depth_img).unsqueeze(0).float().cuda()
+                else:
+                    future_rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
                 future_rgb_img = np.flipud(future_rgb_img).copy()
                 future_rgb_tensor = einops.rearrange(torch.from_numpy(future_rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
 
@@ -611,6 +670,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
                 cam_images.append(img_chw)
                 future_cam_images.append(future_img_chw)
+                if self.use_depth_sim:
+                    depth_images.append(depth_tensor)
+                    future_depth_images.append(future_depth_tensor)
 
             # Stack per-camera images: [num_cameras, C, H, W]
             dynamic_actions.append(dynamic_action)
@@ -621,7 +683,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             for i in range(2):
                 if i < len(pose_set) and pose_set[i] is not None:
                     cam_pose_mat = np.array(pose_set[i], dtype=np.float32)
-                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat).float().cuda())
+                    cam_pose_mat_norm = cam_pose_mat.copy()
+                    cam_pose_mat_norm[:3, 3] /= self.t_scale
+                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat_norm).float().cuda())
                 else:
                     cam_extrinsics_list.append(torch.zeros(4, 4, device='cuda'))
             cam_extrinsics = torch.stack(cam_extrinsics_list, dim=0)
@@ -632,11 +696,32 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         future_image_tensor = torch.stack(future_cam_images, dim=0)
         dynamic_actions = np.array(dynamic_actions)
         dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        img1_for_depth=F.interpolate(image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+        img2_for_depth=F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+        img1_224_for_optical = img1_for_depth.clamp_(0, 1).mul_(255.0)
+        img2_224_for_optical = img2_for_depth.clamp_(0, 1).mul_(255.0)
+        
+        with torch.no_grad():
+            self.preprocess_model.eval()
+            optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
+            if self.use_depth_model:
+                depth1 = self.depth_backbone(img1_for_depth).unsqueeze(1)
+                depth2 = self.depth_backbone(img2_for_depth).unsqueeze(1)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+                # self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
+            elif self.use_depth_sim:
+                depth1 = torch.stack(depth_images, dim=0)
+                depth2 = torch.stack(future_depth_images, dim=0)
+                depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+        
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
             'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
-            'cam_extrinsics': cam_extrinsics
+            'cam_extrinsics': cam_extrinsics,
+            "optical_flow": optical_flow,
         }
 
     def __del__(self):
@@ -707,7 +792,7 @@ def load_data(args, env, val_split=0.1):
     return train_dataloader, val_dataloader, norm_stats
 
 
-def load_implicit_extrinsic_data(args, env, val_split=0.1):
+def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None):
     with h5py.File(args.dataset_path, 'r') as f:
         available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
 
@@ -730,9 +815,11 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1):
         transform=args.transform,
         env=env,
         num_dynamic_feature=args.num_dynamic_feature,
-        window_size=args.window_size
+        window_size=args.window_size,
+        preprocess_model=preprocess_model,
+        translation_normalize_extrinsic=args.translation_normalize_extrinsic
     )
-
+    norm_stats['train_t_scale'] = np.array([train_dataset.t_scale])
     print("Loading validation dataset...")
     val_dataset = EpisodicImplicitExtrinsicDataset(
         val_indices,
@@ -742,8 +829,11 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1):
         transform="id",  # Use simpler transform for validation
         env=env,
         num_dynamic_feature=args.num_dynamic_feature,
-        window_size=args.window_size
+        window_size=args.window_size,
+        preprocess_model=preprocess_model,
+        translation_normalize_extrinsic=args.translation_normalize_extrinsic
     )
+    norm_stats['val_t_scale'] = np.array([val_dataset.t_scale])
     print("Datasets loaded.")
 
     max_seq_length = train_dataset.max_seq_length
