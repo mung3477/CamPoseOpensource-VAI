@@ -83,7 +83,7 @@ optical_backbone_cfg = {
     "strict_resume": False,
 }
 
-def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None, use_depth=False):
+def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None, use_depth=False, use_robot_eef_poses=False):
     #define optical backbone class
     optical_backbone = UniMatch(feature_channels=optical_backbone_cfg["feature_channels"],
                     num_scales=optical_backbone_cfg["num_scales"],
@@ -99,8 +99,7 @@ def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_
         print('Load Flow checkpoint: %s' % optical_backbone_cfg["resume"])
         optical_checkpoint = torch.load(optical_backbone_cfg["resume"])
         optical_backbone.load_state_dict(optical_checkpoint['model'], strict=optical_backbone_cfg["strict_resume"])
-    
-    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path, use_depth=use_depth)
+    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path, use_depth=use_depth, use_robot_eef_poses=use_robot_eef_poses)
     #backbone_projector_model = UniMatchVisionBackbone(base_unimatch=backbone_model, fuse_multiscale=False, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob)
     return backbone_projector_model
 
@@ -138,7 +137,7 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path, use_depth=args.use_depth_model or args.use_depth_sim).to(torch.device("cuda"))
+    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path, use_depth=args.use_depth_model or args.use_depth_sim, use_robot_eef_poses=args.use_robot_eef_poses).to(torch.device("cuda"))
     lr = getattr(args, "lr", 3e-4)
     wd = getattr(args, "weight_decay", 1e-4)
     optimizer = torch.optim.AdamW(implicit_extrinsic_backbone.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95))
@@ -197,10 +196,16 @@ def main(args, ckpt=None):
                         gt_extrinsic = data['cam_extrinsics'][:, 0]
                         optical_flow = einops.rearrange(optical_flow, "b s n ... -> s b n ...")
                         action = einops.rearrange(action, "b s n ... -> s b n ...")
-
                         optical_flow = einops.rearrange(optical_flow, "s b c h w -> (s b) c h w")
                         flat_action = einops.rearrange(action, "s b a -> (s b) a")
-                        preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow)
+
+                        if args.use_robot_eef_poses:
+                            robot_eef_poses = data['robot_eef_poses'].squeeze(2)
+                            robot_eef_poses = einops.rearrange(robot_eef_poses, "b s n ... -> s b n ...")
+                            robot_eef_poses = einops.rearrange(robot_eef_poses, "s b n ... -> (s b) n ...")
+                        else:
+                            robot_eef_poses = None
+                        preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow, robot_eef_poses=robot_eef_poses)
                         t_pred = preds[:, 0:3]
                         r6_pred = preds[:, 3:9]
 
@@ -262,7 +267,13 @@ def main(args, ckpt=None):
                 action = einops.rearrange(action, "b s n ... -> s b n ...")
                 optical_flow = einops.rearrange(optical_flow, "s b c h w -> (s b) c h w")
                 flat_action = einops.rearrange(action, "s b a -> (s b) a")
-                preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow)
+                if args.use_robot_eef_poses:
+                    robot_eef_poses = data['robot_eef_poses'].squeeze(2)
+                    robot_eef_poses = einops.rearrange(robot_eef_poses, "b s n ... -> s b n ...")
+                    robot_eef_poses = einops.rearrange(robot_eef_poses, "s b n ... -> (s b) n ...")
+                else:
+                    robot_eef_poses = None
+                preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow, robot_eef_poses=robot_eef_poses)
 
                 t_pred = preds[:, 0:3]
                 r6_pred = preds[:, 3:9]
@@ -387,7 +398,7 @@ if __name__ == '__main__':
     parser.add_argument('--translation_normalize_extrinsic', default=False, type=str2bool, help='whether to normalize the extrinsic translation')
     parser.add_argument('--use_depth_sim', default=False, type=str2bool, help='use depth input in backbone')
     parser.add_argument('--use_depth_model', default=False, type=str2bool, help='use depth input in backbone')
-    parser.add_argument('--use_proprioceptive_state', default=False, type=str2bool, help='use proprioceptive state in backbone')
+    parser.add_argument('--use_robot_eef_poses', default=False, type=str2bool, help='use robot eef position in backbone')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
