@@ -4,3 +4,7 @@
 [submodule "robosuite_source"]
 	path = robosuite_source
 	url = git@github.com:ripl/robosuite.git
+[submodule "Depth_Anything_V2"]
+	path = Depth_Anything_V2
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git
+	ignore = dirty

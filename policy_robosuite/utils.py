@@ -14,11 +14,24 @@ import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 from cam_embedding import PluckerEmbedder
 import torch.nn.functional as F
+from Depth_Anything_V2.depth_anything_v2.dpt import DepthAnythingV2
 
 from eval import to_mp4
 
 # --- Utility Functions ---
 
+from torchvision.utils import save_image
+
+def save_depth_gray(depth_b1hw: torch.Tensor, path: str):
+    d = depth_b1hw.detach().float().cpu()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    d0 = d[0]  # (1,H,W)
+    dmin = d0.min()
+    dmax = d0.max()
+    d0n = (d0 - dmin) / (dmax - dmin + 1e-6)
+
+    save_image(d0n, path)
 def set_seed(seed):
     """Set seed for reproducibility."""
     random.seed(seed)
@@ -533,7 +546,23 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             ])
         else:
             raise ValueError("Invalid transform type. Choose 'id', 'crop', 'jitter', or 'crop_jitter'.")
-            
+
+        self.use_depth_model = args.use_depth_model
+        self.use_depth_sim = args.use_depth_sim
+        # error use both depth model and depth sim
+        assert not (self.use_depth_model and self.use_depth_sim), "Cannot use both depth model and depth sim simultaneously."
+        if self.use_depth_model:
+            model_configs = {
+                    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+                    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+                    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+                    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+                }
+            encoder = 'vitl'
+            self.depth_backbone = DepthAnythingV2(**model_configs[encoder])
+            self.depth_backbone.load_state_dict(torch.load(f'Depth_Anything_V2/checkpoints/depth_anything_v2_{encoder}.pth'))
+            self.depth_backbone = self.depth_backbone.to("cuda").eval()
+
     def __len__(self):
         return len(self.demo_indices)
     
@@ -572,7 +601,8 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         future_cam_images = []
         dynamic_actions = []
         cam_extrinsic_list = []
-
+        depth_images = []
+        future_depth_images = []
         if not self.args.default_cam:
             start = self.args.m * demo_idx
             end = start + self.args.n
@@ -599,7 +629,12 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     cam_pose = np.array(cam_pose_raw)
                     self._set_camera_pose(cam_pose)
                 self.env.sim.forward()
-                rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
+                if self.use_depth_sim:
+                    rgb_img, depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=True)
+                    depth_img = np.flipud(depth_img).copy()
+                    depth_tensor = torch.from_numpy(depth_img).unsqueeze(0).float().cuda()
+                else:
+                    rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
                 rgb_img = np.flipud(rgb_img).copy()
                 rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
 
@@ -618,7 +653,12 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     self.env.step(dynamic_action)
 
                 self.env.sim.forward()
-                future_rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
+                if self.use_depth_sim:
+                    future_rgb_img, future_depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=True)
+                    future_depth_img = np.flipud(future_depth_img).copy()
+                    future_depth_tensor = torch.from_numpy(future_depth_img).unsqueeze(0).float().cuda()
+                else:
+                    future_rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
                 future_rgb_img = np.flipud(future_rgb_img).copy()
                 future_rgb_tensor = einops.rearrange(torch.from_numpy(future_rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
 
@@ -629,6 +669,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
                 cam_images.append(img_chw)
                 future_cam_images.append(future_img_chw)
+                if self.use_depth_sim:
+                    depth_images.append(depth_tensor)
+                    future_depth_images.append(future_depth_tensor)
 
             # Stack per-camera images: [num_cameras, C, H, W]
             dynamic_actions.append(dynamic_action)
@@ -652,11 +695,26 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         future_image_tensor = torch.stack(future_cam_images, dim=0)
         dynamic_actions = np.array(dynamic_actions)
         dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
-        img1_224 = F.interpolate(image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
-        img2_224 = F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+        img1_for_depth=F.interpolate(image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+        img2_for_depth=F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+        img1_224_for_optical = img1_for_depth.clamp_(0, 1).mul_(255.0)
+        img2_224_for_optical = img2_for_depth.clamp_(0, 1).mul_(255.0)
+        
         with torch.no_grad():
             self.preprocess_model.eval()
-            optical_flow = self.preprocess_model.extract_flow(img1_224, img2_224)
+            optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
+            if self.use_depth_model:
+                depth1 = self.depth_backbone(img1_for_depth).unsqueeze(1)
+                depth2 = self.depth_backbone(img2_for_depth).unsqueeze(1)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+                # self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
+            elif self.use_depth_sim:
+                depth1 = torch.stack(depth_images, dim=0)
+                depth2 = torch.stack(future_depth_images, dim=0)
+                depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+        
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
