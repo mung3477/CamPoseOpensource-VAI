@@ -625,6 +625,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             dynamic_action = actions[start_ts]
 
             for cam_pose_raw in pose_set:
+                assert len(pose_set) == 1, "Only support single camera for dynamic feature extraction."
                 if not self.args.default_cam:
                     cam_pose = np.array(cam_pose_raw)
                     self._set_camera_pose(cam_pose)
@@ -648,9 +649,8 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
                 else:
                     img_chw = rgb_tensor
-
                 for j in range(self.window_size):
-                    self.env.step(dynamic_action)
+                    obs = self.env.step(dynamic_action)
 
                 self.env.sim.forward()
                 if self.use_depth_sim:

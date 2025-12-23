@@ -387,6 +387,7 @@ if __name__ == '__main__':
     parser.add_argument('--translation_normalize_extrinsic', default=False, type=str2bool, help='whether to normalize the extrinsic translation')
     parser.add_argument('--use_depth_sim', default=False, type=str2bool, help='use depth input in backbone')
     parser.add_argument('--use_depth_model', default=False, type=str2bool, help='use depth input in backbone')
+    parser.add_argument('--use_proprioceptive_state', default=False, type=str2bool, help='use proprioceptive state in backbone')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
