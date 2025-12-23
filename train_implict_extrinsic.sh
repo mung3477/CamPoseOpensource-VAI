@@ -18,5 +18,5 @@ CUDA_VISIBLE_DEVICES=0 python policy_robosuite/train_implicit_extrinsic.py \
 --seed 0 \
 --num_epochs 1000 \
 --use_fp16 "0" \
---translation_normalize_extrinsic "0" \
+--translation_normalize_extrinsic "1" \
 --use_depth_sim "1"
