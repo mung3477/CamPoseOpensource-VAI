@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
 from cam_embedding import PluckerEmbedder
+import torch.nn.functional as F
 
 from eval import to_mp4
 
@@ -443,7 +444,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
     Renders images on-the-fly with dynamic camera poses and Plucker embeddings.
     """
     def __init__(self, demo_indices, norm_stats, args, camera_poses_file=None,
-                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None):
+                 max_seq_length=None, transform="id", env=None, num_dynamic_feature=None, window_size=None, preprocess_model=None, translation_normalize_extrinsic=False):
         """
         Args:
             demo_indices (list): List of demonstration indices to use
@@ -463,6 +464,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.num_cameras = args.num_side_cam
         self.num_dynamic_feature = num_dynamic_feature
         self.window_size = window_size
+        self.preprocess_model = preprocess_model
         if not self.args.default_cam:
             poses_path = os.path.join(self.args.camera_poses_dir, camera_poses_file)
             with open(poses_path, 'r') as f:
@@ -483,6 +485,19 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.demo_states = []
         self.demo_actions = []
         self.demo_lengths = []
+        self.translation_normalize_extrinsic = translation_normalize_extrinsic
+
+        if not self.args.default_cam and self.translation_normalize_extrinsic:
+            poses = np.asarray(self.camera_poses, dtype=np.float32)  # (N,4,4)
+            t = poses[:, :3, 3]                                      # (N,3)
+            t_mean = t.mean(axis=0, keepdims=True)                   # (1,3)
+            Z = np.linalg.norm(t - t_mean, axis=1).mean()            # scalar
+
+            self.t_scale = float(max(Z, 1e-6))                       # avoid /0
+            # (선택) 로그
+            print(f"[Extrinsic] translation scale Z={self.t_scale:.6f}")
+        else:
+            self.t_scale = 1.0
 
         print(f"Loading robosuite data for {len(demo_indices)} demos from {args.dataset_path}...")
         with h5py.File(args.dataset_path, "r") as dataset_file:
@@ -567,9 +582,13 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         else:
             pose_set = [None] * self.args.num_side_cam
 
-        for idx in range(self.num_dynamic_feature):
+        if demo_length >= self.num_dynamic_feature:
+            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=False)
+        else:
+            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=True)
 
-            start_ts = np.random.randint(demo_length)
+        for idx in range(self.num_dynamic_feature):
+            start_ts = start_ts_list[idx]
 
             self.env.sim.set_state_from_flattened(states[start_ts])
             self.env.set_init_action()
@@ -620,7 +639,9 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             for i in range(2):
                 if i < len(pose_set) and pose_set[i] is not None:
                     cam_pose_mat = np.array(pose_set[i], dtype=np.float32)
-                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat).float().cuda())
+                    cam_pose_mat_norm = cam_pose_mat.copy()
+                    cam_pose_mat_norm[:3, 3] /= self.t_scale
+                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat_norm).float().cuda())
                 else:
                     cam_extrinsics_list.append(torch.zeros(4, 4, device='cuda'))
             cam_extrinsics = torch.stack(cam_extrinsics_list, dim=0)
@@ -631,11 +652,17 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         future_image_tensor = torch.stack(future_cam_images, dim=0)
         dynamic_actions = np.array(dynamic_actions)
         dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        img1_224 = F.interpolate(image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+        img2_224 = F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True).clamp_(0, 1).mul_(255.0)
+        with torch.no_grad():
+            self.preprocess_model.eval()
+            optical_flow = self.preprocess_model.extract_flow(img1_224, img2_224)
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
             'dynamic_actions_normalized': torch.from_numpy(dynamic_actions_normalized).float().cuda(),
-            'cam_extrinsics': cam_extrinsics
+            'cam_extrinsics': cam_extrinsics,
+            "optical_flow": optical_flow,
         }
 
     def __del__(self):
@@ -706,7 +733,7 @@ def load_data(args, env, val_split=0.1):
     return train_dataloader, val_dataloader, norm_stats
 
 
-def load_implicit_extrinsic_data(args, env, val_split=0.1):
+def load_implicit_extrinsic_data(args, env, val_split=0.1, preprocess_model=None):
     with h5py.File(args.dataset_path, 'r') as f:
         available_demos = len([k for k in f['data'].keys() if k.startswith('demo_')])
 
@@ -729,9 +756,11 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1):
         transform=args.transform,
         env=env,
         num_dynamic_feature=args.num_dynamic_feature,
-        window_size=args.window_size
+        window_size=args.window_size,
+        preprocess_model=preprocess_model,
+        translation_normalize_extrinsic=args.translation_normalize_extrinsic
     )
-
+    norm_stats['train_t_scale'] = np.array([train_dataset.t_scale])
     print("Loading validation dataset...")
     val_dataset = EpisodicImplicitExtrinsicDataset(
         val_indices,
@@ -741,8 +770,11 @@ def load_implicit_extrinsic_data(args, env, val_split=0.1):
         transform="id",  # Use simpler transform for validation
         env=env,
         num_dynamic_feature=args.num_dynamic_feature,
-        window_size=args.window_size
+        window_size=args.window_size,
+        preprocess_model=preprocess_model,
+        translation_normalize_extrinsic=args.translation_normalize_extrinsic
     )
+    norm_stats['val_t_scale'] = np.array([val_dataset.t_scale])
     print("Datasets loaded.")
 
     max_seq_length = train_dataset.max_seq_length
