@@ -4,3 +4,5 @@ hf_weights/
 **/__pycache__/
 **/demos/
 unimatch/
+*.png
+debug/

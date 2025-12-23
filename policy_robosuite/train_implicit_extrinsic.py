@@ -83,7 +83,7 @@ optical_backbone_cfg = {
     "strict_resume": False,
 }
 
-def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None):
+def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None, use_depth=False):
     #define optical backbone class
     optical_backbone = UniMatch(feature_channels=optical_backbone_cfg["feature_channels"],
                     num_scales=optical_backbone_cfg["num_scales"],
@@ -100,7 +100,7 @@ def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_
         optical_checkpoint = torch.load(optical_backbone_cfg["resume"])
         optical_backbone.load_state_dict(optical_checkpoint['model'], strict=optical_backbone_cfg["strict_resume"])
     
-    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path)
+    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path, use_depth=use_depth)
     #backbone_projector_model = UniMatchVisionBackbone(base_unimatch=backbone_model, fuse_multiscale=False, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob)
     return backbone_projector_model
 
@@ -138,7 +138,7 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path).to(torch.device("cuda"))
+    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path, use_depth=args.use_depth_model or args.use_depth_sim).to(torch.device("cuda"))
     lr = getattr(args, "lr", 3e-4)
     wd = getattr(args, "weight_decay", 1e-4)
     optimizer = torch.optim.AdamW(implicit_extrinsic_backbone.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95))
@@ -384,6 +384,8 @@ if __name__ == '__main__':
     parser.add_argument('--window_size', type=int, default=5, help='window size for temporal context')
     parser.add_argument('--use_linear_prob', default=False, type=str2bool, help='use linear probability')
     parser.add_argument('--load_pretrained_dynamic_model_path', type=str, default=None, help='path to pretrained dynamic model checkpoint')
+    parser.add_argument('--use_depth_sim', default=False, type=str2bool, help='use depth input in backbone')
+    parser.add_argument('--use_depth_model', default=False, type=str2bool, help='use depth input in backbone')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
