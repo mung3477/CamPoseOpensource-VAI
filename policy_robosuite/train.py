@@ -154,7 +154,7 @@ def main(args, ckpt=None):
                 'loss': epoch_summary['loss'],
                 'wandb_id': wandb.run.id
             }, checkpoint_path)
-            cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
+            cleanup_ckpt(args.ckpt_dir, keep=10)  # Keep last 10 checkpoints
 
             # No Timeout
             # if time.time() - start_time > 7.5 * 60 * 60:
