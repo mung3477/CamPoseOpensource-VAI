@@ -60,7 +60,7 @@ class RgbEncoder(nn.Module):
         super().__init__()
         self.use_plucker = use_plucker
         backbone_model = getattr(torchvision.models, backbone)(weights=None)
-        
+
         # Modify first conv layer for Plucker if needed
         if use_plucker:
             original_conv = backbone_model.conv1
@@ -72,7 +72,7 @@ class RgbEncoder(nn.Module):
                 padding=original_conv.padding,
                 bias=original_conv.bias is not None
             )
-        
+
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
         if use_group_norm:
             self.backbone = _replace_submodules(
@@ -369,6 +369,9 @@ class DiffusionPolicy(nn.Module):
         betas = (0.9, 0.999)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=float(args.lr), betas=betas, weight_decay=float(args.weight_decay))
 
+        # Dynamics Embedding
+        self.use_dynamic_feature = args.use_dynamic_feature
+
     def configure_optimizers(self):
         return self.optimizer
 
@@ -389,7 +392,7 @@ class DiffusionPolicy(nn.Module):
             images = images[:, :, :3, ...]
         elif self.use_plucker and images.size(2) != 9:
             raise ValueError(f"When use_plucker=True, expected 9 channels (RGB + 6 Plucker) but got {images.size(2)}")
-        
+
         # Ensure we actually have the expected number of cameras; if more were provided,
         # keep the first self.num_cameras.
         # Expect exactly num_cameras views
@@ -399,6 +402,10 @@ class DiffusionPolicy(nn.Module):
         img_feats = self.rgb_encoder(img_bsnchw)  # ((B*N), F)
         img_feats = einops.rearrange(img_feats, "(b n) f -> b (n f)", b=B, n=self.num_cameras)
         global_cond = img_feats  # (B, N*F)
+
+        # Dynamics Embeddings
+        if self.use_dynamic_feature:
+            pass
 
         return local_cond, global_cond
 
