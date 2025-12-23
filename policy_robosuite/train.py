@@ -212,6 +212,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=False, type=str2bool, help='use Plucker embeddings')
+    parser.add_argument('--wandb_project_name', type=str, default='DynamicVLA', help='wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity')
 
     # Camera pose config
     parser.add_argument('--train_poses_file', type=str, default='train_cameras.json', help='Path to training camera poses JSON (old flat format)')
@@ -269,8 +271,6 @@ if __name__ == '__main__':
     # SmolVLA finetuning flags
     parser.add_argument('--freeze_vision_encoder', type=str2bool, default=False, help='freeze the vision encoder (SigLIP)')
     parser.add_argument('--train_expert_only', type=str2bool, default=False, help='train only the action expert; freeze VLM')
-    parser.add_argument('--wandb_project_name', type=str, default='DynamicVLA', help='wandb project name')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
@@ -302,7 +302,7 @@ if __name__ == '__main__':
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path)
         wandb_id = ckpt['wandb_id']
-        wandb.init(project='test', id=wandb_id, resume='must', group=group)
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, id=wandb_id, resume='must', group=group)
         main(args, ckpt)
     else:
         print(f"Starting new training run: {args.name}")

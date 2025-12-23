@@ -53,7 +53,7 @@ def main(args, ckpt=None):
     # Build ManiSkill environment
     env = gym.make(env_id, **env_kwargs)
     env.reset()
-    
+
     train_dataloader, val_dataloader, stats = load_data(
         args=args,
         env=env
@@ -86,7 +86,7 @@ def main(args, ckpt=None):
         scheduler = cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     else:
         scheduler = constant_schedule(optimizer)
-    
+
     epoch = 0
     if ckpt is not None:
         policy.load_state_dict(ckpt['model_state_dict'])
@@ -96,10 +96,10 @@ def main(args, ckpt=None):
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         epoch = ckpt['epoch'] + 1
         print(f"Resumed from checkpoint at epoch {ckpt['epoch']}")
-    
+
     pbar = tqdm.tqdm(total=args.num_epochs, desc="Training")
     pbar.update(epoch)
-    
+
     while epoch < args.num_epochs:
         # Validation
         if epoch % 10 == 0:
@@ -142,18 +142,20 @@ def main(args, ckpt=None):
         if epoch % args.save_every == 0:
             checkpoint_path = os.path.join(args.ckpt_dir, f'epoch_{epoch}.pth')
             torch.save({
-                'epoch': epoch, 
+                'epoch': epoch,
                 'model_state_dict': policy.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'loss': epoch_summary['loss'], 
+                'loss': epoch_summary['loss'],
                 'wandb_id': wandb.run.id
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
-            if time.time() - start_time > 7.5 * 60 * 60:
-                print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
-                break
+            # No Timeout
+            # if time.time() - start_time > 7.5 * 60 * 60:
+            #     print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
+            #     break
+
         # Training
         train_history = []
         policy.train()
@@ -161,7 +163,7 @@ def main(args, ckpt=None):
             with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
                 forward_dict = policy(data)
                 loss = forward_dict['loss']
-            
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             optimizer.step()
@@ -169,7 +171,7 @@ def main(args, ckpt=None):
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             train_history.append(detach_dict(forward_dict))
-        
+
         epoch_summary = compute_dict_mean(train_history)
         for k, v in epoch_summary.items():
             wandb.log({f'train_{k}': v.item()}, step=epoch)
@@ -187,7 +189,7 @@ if __name__ == '__main__':
 
     # General config
     parser.add_argument('--name', type=str, default='test_maniskill', help='name for the run')
-    parser.add_argument('--dataset_dir', type=str, 
+    parser.add_argument('--dataset_dir', type=str,
                         default=None,
                         help='Path to demos root directory (absolute). If None, defaults to policy_maniskill/demos')
     parser.add_argument('--dataset_suffix', type=str, default='push_rand', help='dataset subfolder under demos/')
@@ -198,6 +200,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=True, type=str2bool, help='use Plucker embeddings')
+    parser.add_argument('--wandb_project_name', type=str, default='DynamicVLA', help='wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity')
 
     # Camera pose config
     parser.add_argument('--n', type=int, default=3, help='Number of cameras per window W(i) = [m*i, m*i + n)')
@@ -214,9 +218,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr_scheduler', type=str, default='const', help='lr scheduler: const, cosine')
     parser.add_argument('--save_every', type=int, default=1000, help='save checkpoint every N epochs')
     parser.add_argument('--use_fp16', default=True, type=str2bool, help='use mixed precision bf16 training')
-    
+
     # Dataloader config
-    parser.add_argument('--transform', type=str, default='crop', choices=['crop', 'id', 'crop_jitter'], 
+    parser.add_argument('--transform', type=str, default='crop', choices=['crop', 'id', 'crop_jitter'],
                         help='Image transformation type')
     parser.add_argument('--prob_drop_proprio', default=1., type=float, help='probability to drop proprio')
     parser.add_argument('--use_cam_pose', default=False, type=bool, help='otherwise mask to 0')
@@ -231,8 +235,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', type=int, default=512, help='hidden_dim')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight_decay')
     parser.add_argument('--obs_dim', type=int, default=7, help='observation dimension')
-    
-    
+
+
     parser.add_argument('--nheads', type=int, default=8, help='number of attention heads')
     parser.add_argument('--ffn_dim', type=int, default=2048, help='feedforward network dimension')
     parser.add_argument('--enc_layers', type=int, default=4, help='number of encoder layers')
@@ -268,22 +272,22 @@ if __name__ == '__main__':
         args.ckpt_dir = str((MODULE_ROOT / "checkpoints" / args.name).resolve())
     args.dataset_path = os.path.join(args.dataset_dir, args.dataset_suffix)
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    
+
     # Save config
     config_path = os.path.join(args.ckpt_dir, 'config.json')
     with open(config_path, 'w') as f:
         json.dump(vars(args), f, indent=4)
-    
+
     # Check for existing checkpoint to resume
     ckpt_path = get_last_ckpt(args.ckpt_dir)
-    
+
     if ckpt_path is not None:
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path)
         wandb_id = ckpt['wandb_id']
-        wandb.init(project='CamPoseManiskill_training', id=wandb_id, resume='must', group=group)
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, id=wandb_id, resume='must', group=group)
         main(args, ckpt)
     else:
         print(f"Starting new training run: {args.name}")
-        wandb.init(project='CamPoseManiskill_training', name=args.name, config=vars(args), group=group)
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, name=args.name, config=vars(args), group=group)
         main(args)

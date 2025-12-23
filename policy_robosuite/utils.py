@@ -335,6 +335,7 @@ class EpisodicDataset(Dataset):
         else:
             raise ValueError("Invalid transform type. Choose 'id', 'crop', 'jitter', or 'crop_jitter'.")
 
+
     def __len__(self):
         return len(self.demo_indices)
 
@@ -436,6 +437,10 @@ class EpisodicDataset(Dataset):
 
         state_normalized = (robot_qpos - self.norm_stats["state_mean"]) / self.norm_stats["state_std"]
         actions_normalized = (padded_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+
+        if self.use_dynamic_feature:
+
+
         return {
             'image': image_tensor,
             'qpos': torch.from_numpy(state_normalized).float().cuda(),
@@ -593,16 +598,22 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
         self.env.sim.model.cam_quat[cam_id] = [quat[3], quat[0], quat[1], quat[2]]
 
-    def __getitem__(self, demo_idx):
-        demo_length = self.demo_lengths[demo_idx]
-        states = self.demo_states[demo_idx]
-        actions = self.demo_actions[demo_idx]
-        cam_images = []
-        future_cam_images = []
-        dynamic_actions = []
-        cam_extrinsic_list = []
-        depth_images = []
-        future_depth_images = []
+    def _render_cur_scene(self, use_depth: bool = False):
+        rgb_img, depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=use_depth)
+        rgb_img = np.flipud(rgb_img).copy()
+        rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
+
+        if use_depth:
+            depth_img = np.flipud(depth_img).copy()
+            depth_tensor = torch.from_numpy(depth_img).unsqueeze(0).float().cuda()
+        else:
+            depth_tensor = None
+
+        return rgb_tensor, depth_tensor
+
+    def _get_pose_set(self, demo_idx):
+        pose_set = list()
+
         if not self.args.default_cam:
             start = self.args.m * demo_idx
             end = start + self.args.n
@@ -612,17 +623,49 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         else:
             pose_set = [None] * self.args.num_side_cam
 
-        if demo_length >= self.num_dynamic_feature:
-            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=False)
+        return pose_set
+
+    def _get_plucker_emb(self):
+        if self.use_plucker and not self.args.default_cam:
+            intrinsics = self._get_camera_intrinsics()
+            intrinsics_tensor = torch.from_numpy(intrinsics).unsqueeze(0).float().cuda()
+            cam_to_world_tensor = torch.from_numpy(cam_pose).unsqueeze(0).float().cuda()
+            with torch.no_grad():
+                plucker_data = self.plucker_embedder(intrinsics_tensor, cam_to_world_tensor)
+                plucker_tensor = einops.rearrange(plucker_data['plucker'][0], 'h w c -> c h w')
         else:
-            start_ts_list = np.random.choice(demo_length, size=self.num_dynamic_feature, replace=True)
+            plucker_tensor = None
+
+        return plucker_tensor
+
+
+    def __getitem__(self, demo_idx):
+        demo_length = self.demo_lengths[demo_idx]
+        states = self.demo_states[demo_idx]
+        actions = self.demo_actions[demo_idx]
+
+        cam_images = []
+        future_cam_images = []
+
+        dynamic_actions = []
+
+        depth_images = []
+        future_depth_images = []
+
+        pose_set = self._get_pose_set(demo_idx)
+
+        start_ts_list = np.random.choice(
+            demo_length,
+            size=self.num_dynamic_feature,
+            replace=demo_length < self.num_dynamic_feature
+        )
 
         for idx in range(self.num_dynamic_feature):
             start_ts = start_ts_list[idx]
+            dynamic_action = actions[start_ts]
 
             self.env.sim.set_state_from_flattened(states[start_ts])
             self.env.set_init_action()
-            dynamic_action = actions[start_ts]
 
             for cam_pose_raw in pose_set:
                 assert len(pose_set) == 1, "Only support single camera for dynamic feature extraction."
@@ -652,23 +695,25 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                 for j in range(self.window_size):
                     obs = self.env.step(dynamic_action)
 
-                self.env.sim.forward()
-                if self.use_depth_sim:
-                    future_rgb_img, future_depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=True)
-                    future_depth_img = np.flipud(future_depth_img).copy()
-                    future_depth_tensor = torch.from_numpy(future_depth_img).unsqueeze(0).float().cuda()
-                else:
-                    future_rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
-                future_rgb_img = np.flipud(future_rgb_img).copy()
-                future_rgb_tensor = einops.rearrange(torch.from_numpy(future_rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
+                rgb_tensor, depth_tensor = self._render_cur_scene(use_depth=self.use_depth_sim)
 
-                if self.use_plucker and not self.args.default_cam:
-                    future_img_chw = torch.cat([future_rgb_tensor, plucker_tensor], dim=0)
-                else:
-                    future_img_chw = future_rgb_tensor
-
+                plucker_tensor = self._get_plucker_emb()
+                img_chw = rgb_tensor \
+                    if plucker_tensor is None \
+                    else torch.cat([rgb_tensor, plucker_tensor], dim=0)
                 cam_images.append(img_chw)
+
+                for _ in range(self.window_size):
+                    self.env.step(dynamic_action)
+
+                self.env.sim.forward()
+
+                future_rgb_tensor, future_depth_tensor = self._render_cur_scene(use_depth=self.use_depth_sim)
+                future_img_chw = rgb_tensor \
+                    if plucker_tensor is None \
+                    else torch.cat([rgb_tensor, plucker_tensor], dim=0)
                 future_cam_images.append(future_img_chw)
+
                 if self.use_depth_sim:
                     depth_images.append(depth_tensor)
                     future_depth_images.append(future_depth_tensor)
@@ -691,15 +736,17 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         else:
             cam_extrinsics = torch.zeros(2, 4, 4, device='cuda')
 
-        image_tensor = torch.stack(cam_images, dim=0)
-        future_image_tensor = torch.stack(future_cam_images, dim=0)
         dynamic_actions = np.array(dynamic_actions)
         dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+
+        # Calculate optical flow features
+        image_tensor = torch.stack(cam_images, dim=0)
+        future_image_tensor = torch.stack(future_cam_images, dim=0)
         img1_for_depth=F.interpolate(image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
         img2_for_depth=F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
         img1_224_for_optical = img1_for_depth.clamp_(0, 1).mul_(255.0)
         img2_224_for_optical = img2_for_depth.clamp_(0, 1).mul_(255.0)
-        
+
         with torch.no_grad():
             self.preprocess_model.eval()
             optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
@@ -714,7 +761,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                 depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
-        
+
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
