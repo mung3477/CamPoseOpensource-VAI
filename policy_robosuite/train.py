@@ -271,6 +271,8 @@ if __name__ == '__main__':
     # SmolVLA finetuning flags
     parser.add_argument('--freeze_vision_encoder', type=str2bool, default=False, help='freeze the vision encoder (SigLIP)')
     parser.add_argument('--train_expert_only', type=str2bool, default=False, help='train only the action expert; freeze VLM')
+    parser.add_argument('--use_dynamic_feature', type=str2bool, default=False, help='use dynamic feature')
+    parser.add_argument('--use_dynamics_basis', type=str2bool, default=False, help='use dynamics basis model')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name

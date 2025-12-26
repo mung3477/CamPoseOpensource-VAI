@@ -381,7 +381,6 @@ class DiffusionPolicy(nn.Module):
         images = data_dict["image"].to(device)  # (B, N, C, H, W)
         B = qpos.shape[0]
         T = self.horizon
-
         # local_cond: (B, T, obs_dim) — replicate current proprio across horizon
         local_cond = qpos.unsqueeze(1).expand(B, T, self.obs_dim)
 
