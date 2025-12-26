@@ -2,6 +2,9 @@ import os
 import re
 import json
 import argparse
+from typing import Literal
+
+_DatasetType = Literal['train', 'test']
 
 def get_last_n_ckpt_names(ckpt_dir: str, n: int):
     """Get the last n checkpoints in the directory."""
@@ -15,8 +18,8 @@ def get_last_n_ckpt_names(ckpt_dir: str, n: int):
     ckpts.sort()
     return ckpts[-n:]
 
-def get_last_n_ckpt_eval_results(ckpt_dir: str, n: int):
-    eval_result_name_template = os.path.join(ckpt_dir, 'eval_{ckpt_name_base}_test_cameras', 'success_by_seed.json')
+def get_last_n_ckpt_eval_results(ckpt_dir: str, n: int, dataset_type: _DatasetType):
+    eval_result_name_template = os.path.join(ckpt_dir, 'eval_{ckpt_name_base}_{dataset_type}_cameras', 'success_by_seed.json')
     ckpt_names = get_last_n_ckpt_names(ckpt_dir, n)
 
     eval_results = []
@@ -26,8 +29,8 @@ def get_last_n_ckpt_eval_results(ckpt_dir: str, n: int):
 
     return eval_results
 
-def calc_success_rate(ckpt_dir: str, n: int = 10):
-    eval_results = get_last_n_ckpt_eval_results(ckpt_dir, n)
+def calc_success_rate(ckpt_dir: str, n: int = 10, dataset_type: _DatasetType = 'test'):
+    eval_results = get_last_n_ckpt_eval_results(ckpt_dir, n, dataset_type)
 
     results = {}
     for eval_result in eval_results:
@@ -70,11 +73,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt_dir",
         type=str,
-        default="/root/Desktop/workspace/CamPoseOpensource-VAI/policy_robosuite/checkpoints/train_dp_use_plucker_robosuite",
+        default="/root/Desktop/workspace/CamPoseOpensource-VAI/policy_robosuite/checkpoints/train_dp_use_plucker_liftrand_eef_delta",
         help="Path to the checkpoint directory"
     )
     parser.add_argument("--n", type=int, default=10, help="Number of checkpoints to evaluate")
+    parser.add_argument("--dataset", type=str, default="test", choices=["train", "test"])
 
     args = parser.parse_args()
 
-    calc_success_rate(args.ckpt_dir, args.n)
+    calc_success_rate(args.ckpt_dir, args.n, args.dataset)
