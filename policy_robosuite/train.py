@@ -273,6 +273,8 @@ if __name__ == '__main__':
     parser.add_argument('--train_expert_only', type=str2bool, default=False, help='train only the action expert; freeze VLM')
     parser.add_argument('--use_dynamic_feature', type=str2bool, default=False, help='use dynamic feature')
     parser.add_argument('--use_dynamics_basis', type=str2bool, default=False, help='use dynamics basis model')
+    parser.add_argument('--use_overlay_basis', type=str2bool, default=False, help='overlay motion basis on RGB image')
+    parser.add_argument('--use_basis_origin_robot', type=str2bool, default=False, help='use robot eef as origin for motion basis visualization')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name

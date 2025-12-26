@@ -36,6 +36,7 @@ def calc_success_rate(ckpt_dir: str, n: int = 10, dataset_type: _DatasetType = '
     results = {}
     for eval_result in eval_results:
         if not os.path.exists(eval_result):
+            print(f"Warning: Evaluation result file {eval_result} does not exist. Skipping.")
             continue
 
         with open(eval_result, 'r') as f:

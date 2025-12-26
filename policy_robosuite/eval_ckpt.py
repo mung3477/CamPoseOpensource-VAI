@@ -71,7 +71,7 @@ def main(args, ckpt=None):
     epoch = 0
     if ckpt is not None:
         policy.load_state_dict(ckpt['model_state_dict'])
-        epoch = ckpt['epoch'] + 1
+        epoch = ckpt['epoch']
         print(f"Resumed from checkpoint at epoch {ckpt['epoch']}")
 
 
