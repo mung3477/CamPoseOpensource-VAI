@@ -793,11 +793,11 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             size=self.num_dynamic_feature,
             replace=demo_length < self.num_dynamic_feature
         )
-
+        dynamic_actions_debug = [np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32), np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32), np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)] 
         for idx in range(self.num_dynamic_feature):
             start_ts = start_ts_list[idx]
-            dynamic_action = actions[start_ts]
-
+            # dynamic_action = actions[start_ts]
+            dynamic_action = dynamic_actions_debug[idx]
             self.env.sim.set_state_from_flattened(states[start_ts])
             self.env.set_init_action()
             for cam_pose_raw in pose_set:
@@ -893,7 +893,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                         origin="pp",   # or "center"
                         arrow_len=70,
                     )
-
+            import pdb; pdb.set_trace()
         return {
             'image': image_tensor,
             'future_image': future_image_tensor,
