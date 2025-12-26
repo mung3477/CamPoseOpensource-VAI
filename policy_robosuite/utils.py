@@ -7,6 +7,8 @@ import re
 import math
 import glob
 import json
+from typing import List
+
 import einops
 from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset, DataLoader
@@ -101,6 +103,18 @@ def get_last_ckpt(ckpt_dir):
                 latest_ckpt = ckpt
 
     return latest_ckpt
+
+def get_all_ckpts(ckpt_dir)->List | None:
+    """Get the latest checkpoint in the directory."""
+    if not os.path.exists(ckpt_dir):
+        return None
+
+    ckpts = glob.glob(os.path.join(ckpt_dir, "epoch_*.pth"))
+    ckpts.sort()
+    if not ckpts:
+        return None
+
+    return ckpts
 
 def cosine_schedule(optimizer, total_steps, eta_min=0.0):
     """Cosine learning rate schedule."""
@@ -465,7 +479,7 @@ class EpisodicDataset(Dataset):
                 plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2], device='cuda')
             if self.args.use_dynamics_basis:
                 motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose).reshape(-1)
-                
+
                 # append as extra channels
                 # 6 * H * W
                 plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
@@ -776,6 +790,38 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
         return plucker_tensor
 
+    def _preprocess_images(self, images):
+        imgs_tensor = torch.stack(images, dim=0)
+        imgs_for_depth = F.interpolate(imgs_tensor, size=(224, 224), mode='bilinear', align_corners=False, antialias=True)
+        imgs_for_optical = imgs_for_depth.clamp_(0, 1).mul_(255.0)
+
+        return {
+            "tensor": imgs_tensor,
+            "for_depth": imgs_for_depth,
+            "for_optical": imgs_for_optical
+        }
+
+    def _get_optical_flow(self, cam_images, future_cam_images):
+        preprocessed_cam_imgs = self._preprocess_images(cam_images)
+        preprocessed_future_cam_imgs = self._preprocess_images(future_cam_images)
+
+        with torch.no_grad():
+            self.preprocess_model.eval()
+            optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
+            if self.use_depth_model:
+                depth1 = self.depth_backbone(img1_for_depth).unsqueeze(1)
+                depth2 = self.depth_backbone(img2_for_depth).unsqueeze(1)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+                # self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
+            elif self.use_depth_sim:
+                depth1 = torch.stack(depth_images, dim=0)
+                depth2 = torch.stack(future_depth_images, dim=0)
+                depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+
+
+
     def _get_motion_dynamics_basis(self, cam_to_world: np.ndarray):
         """
         cam_to_world: (4,4) camera pose matrix from pose_set (agentview).
@@ -925,7 +971,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         img2_for_depth=F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
         img1_224_for_optical = img1_for_depth.clamp_(0, 1).mul_(255.0)
         img2_224_for_optical = img2_for_depth.clamp_(0, 1).mul_(255.0)
-        
+
         with torch.no_grad():
             self.preprocess_model.eval()
             optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
@@ -939,7 +985,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                 depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
-            
+
             if self.args.debug:
                 self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
                 for i in range(2):

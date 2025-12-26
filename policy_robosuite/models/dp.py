@@ -369,8 +369,6 @@ class DiffusionPolicy(nn.Module):
         betas = (0.9, 0.999)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=float(args.lr), betas=betas, weight_decay=float(args.weight_decay))
 
-        # Dynamics Embedding
-        self.use_dynamic_feature = args.use_dynamic_feature
 
     def configure_optimizers(self):
         return self.optimizer
@@ -401,10 +399,6 @@ class DiffusionPolicy(nn.Module):
         img_feats = self.rgb_encoder(img_bsnchw)  # ((B*N), F)
         img_feats = einops.rearrange(img_feats, "(b n) f -> b (n f)", b=B, n=self.num_cameras)
         global_cond = img_feats  # (B, N*F)
-
-        # Dynamics Embeddings
-        if self.use_dynamic_feature:
-            pass
 
         return local_cond, global_cond
 

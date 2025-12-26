@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}/Depth_Anything_V2:${PYTHONPATH}"
 CUDA_VISIBLE_DEVICES=0 python policy_robosuite/train.py \
 --name train_dp_use_plucker_liftrand_eef_delta_use_dynamics_basis_concat_state_debug \
 --policy_class dp \
---use_plucker 1 \
+--use_plucker 0 \
 --wandb_project_name know_camera_train \
 --wandb_entity DynamicVLA \
 --num_epochs 80_001 \
