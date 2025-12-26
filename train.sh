@@ -15,7 +15,6 @@ CUDA_VISIBLE_DEVICES=0 python policy_robosuite/train.py \
 --eval_every 2_000 \
 --save_every 2_000 \
 --use_dynamics_basis 1 \
---obs_dim 13
 
 
 # python policy_maniskill/train.py \

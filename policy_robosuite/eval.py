@@ -192,7 +192,7 @@ class Evaluator:
 
             basis_uv[i] = vec / (n + eps)
 
-        return torch.from_numpy(basis_uv).float().cuda()
+        return torch.from_numpy(basis_uv).float()
 
     def _set_camera_pose(self, cam_to_world):
         """Set camera pose in robosuite environment."""

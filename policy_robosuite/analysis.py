@@ -20,6 +20,7 @@ def get_last_n_ckpt_eval_results(ckpt_dir: str, n: int):
     ckpt_names = get_last_n_ckpt_names(ckpt_dir, n)
 
     eval_results = []
+    assert ckpt_names is not None, f"No checkpoints found in {ckpt_dir}"
     for ckpt_name in ckpt_names:
         ckpt_name_base = ckpt_name.replace('.pth', '')
         eval_results.append(eval_result_name_template.format(ckpt_name_base=ckpt_name_base))
