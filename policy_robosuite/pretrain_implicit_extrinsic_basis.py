@@ -83,7 +83,7 @@ optical_backbone_cfg = {
     "strict_resume": False,
 }
 
-def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None, use_depth=False, use_robot_eef_poses=False):
+def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_feature=3, use_linear_prob=True, load_pretrained_dynamic_model_path=None, use_depth=False, use_robot_eef_poses=False, pred_basis=False):
     #define optical backbone class
     optical_backbone = UniMatch(feature_channels=optical_backbone_cfg["feature_channels"],
                     num_scales=optical_backbone_cfg["num_scales"],
@@ -99,7 +99,7 @@ def load_unimatch_backbone(device, use_dynamic_common_feature=True, num_dynamic_
         print('Load Flow checkpoint: %s' % optical_backbone_cfg["resume"])
         optical_checkpoint = torch.load(optical_backbone_cfg["resume"])
         optical_backbone.load_state_dict(optical_checkpoint['model'], strict=optical_backbone_cfg["strict_resume"])
-    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path, use_depth=use_depth, use_robot_eef_poses=use_robot_eef_poses)
+    backbone_projector_model = UniMatchFlowWDepth(optical_backbone=optical_backbone, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob, load_pretrained_dynamic_model_path=load_pretrained_dynamic_model_path, use_depth=use_depth, use_robot_eef_poses=use_robot_eef_poses, pred_basis=pred_basis)
     #backbone_projector_model = UniMatchVisionBackbone(base_unimatch=backbone_model, fuse_multiscale=False, use_dynamic_common_feature=use_dynamic_common_feature, num_dynamic_feature=num_dynamic_feature, use_linear_prob=use_linear_prob)
     return backbone_projector_model
 
@@ -137,7 +137,7 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path, use_depth=args.use_depth_model or args.use_depth_sim, use_robot_eef_poses=args.use_robot_eef_poses).to(torch.device("cuda"))
+    implicit_extrinsic_backbone = load_unimatch_backbone(device="cuda", use_dynamic_common_feature=True, num_dynamic_feature=args.num_dynamic_feature, use_linear_prob=args.use_linear_prob, load_pretrained_dynamic_model_path=args.load_pretrained_dynamic_model_path, use_depth=args.use_depth_model or args.use_depth_sim, use_robot_eef_poses=args.use_robot_eef_poses, pred_basis=args.pred_basis).to(torch.device("cuda"))
     lr = getattr(args, "lr", 3e-4)
     wd = getattr(args, "weight_decay", 1e-4)
     optimizer = torch.optim.AdamW(implicit_extrinsic_backbone.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95))
@@ -206,25 +206,45 @@ def main(args, ckpt=None):
                         else:
                             robot_eef_poses = None
                         preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow, robot_eef_poses=robot_eef_poses)
-                        t_pred = preds[:, 0:3]
-                        r6_pred = preds[:, 3:9]
+                        preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow, robot_eef_poses=robot_eef_poses)
+                        bp = preds.view(preds.shape[0], 3, 2).float()
+                        gt_basis = data["motion_dynamics_basis_tensor"][:, 0]    # (B,3,2) expected
+                        eps = 1e-6
+                        bg = gt_basis.float()
 
-                        R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
-                        R_gt   = gt_extrinsic[:, :3, :3]
-                        t_gt   = gt_extrinsic[:, :3, 3]
+                        bp = bp / (bp.norm(dim=-1, keepdim=True) + eps)
+                        bg = bg / (bg.norm(dim=-1, keepdim=True) + eps)
+                        cos_sim = (bp * bg).sum(dim=-1)         # (B,3)
+                        loss = (1.0 - cos_sim).mean()
 
-                        loss_t = F.smooth_l1_loss(t_pred, t_gt)
-                        loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
-                        loss = loss_t + loss_R
-                        rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
-                        trans_err = ((t_pred - t_gt) * stats['val_t_scale'][0]).norm(dim=-1).mean()
                         forward_dict = {
                             "loss": loss,
-                            "loss_t": loss_t.detach(),
-                            "loss_R_rad": loss_R.detach(),
-                            "rot_err_deg": rot_err_deg,
-                            "trans_err": trans_err,
+                            "loss_basis": loss.detach(),
+                            "basis_cos": cos_sim.mean().detach(),
                         }
+                        # t_pred = preds[:, 0:3]
+                        # r6_pred = preds[:, 3:9]
+
+                        # R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
+                        # R_gt   = gt_extrinsic[:, :3, :3]
+                        # t_gt   = gt_extrinsic[:, :3, 3]
+
+                        # loss_t = F.smooth_l1_loss(t_pred, t_gt)
+                        # loss_R = F.mse_loss(R_pred, R_gt)               # <- geodesic 대신 L2
+                        # # loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
+                        # loss = loss_t + loss_R
+                        # with torch.no_grad():
+                        #     rot_err_rad = geodesic_rot_loss(R_pred.float(), R_gt.float())
+                        #     rot_err_deg = rot_err_rad.detach() * (180.0 / math.pi)
+                        # # rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
+                        # trans_err = ((t_pred - t_gt) * stats['val_t_scale'][0]).norm(dim=-1).mean()
+                        # forward_dict = {
+                        #     "loss": loss,
+                        #     "loss_t": loss_t.detach(),
+                        #     "loss_R": loss_R.detach(),
+                        #     "rot_err_deg": rot_err_deg,
+                        #     "trans_err": trans_err,
+                        # }
                     epoch_dicts.append(forward_dict)
                 epoch_summary = compute_dict_mean(epoch_dicts)
                 for k, v in epoch_summary.items():
@@ -274,26 +294,45 @@ def main(args, ckpt=None):
                 else:
                     robot_eef_poses = None
                 preds = implicit_extrinsic_backbone(action=flat_action, pre_extract_flow=optical_flow, robot_eef_poses=robot_eef_poses)
+                bp = preds.view(preds.shape[0], 3, 2).float()
+                gt_basis = data["motion_dynamics_basis_tensor"][:, 0]    # (B,3,2) expected
+                eps = 1e-6
+                bg = gt_basis.float()
 
-                t_pred = preds[:, 0:3]
-                r6_pred = preds[:, 3:9]
+                bp = bp / (bp.norm(dim=-1, keepdim=True) + eps)
+                bg = bg / (bg.norm(dim=-1, keepdim=True) + eps)
 
-                R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
-                R_gt   = gt_extrinsic[:, :3, :3]
-                t_gt   = gt_extrinsic[:, :3, 3]
+                cos_sim = (bp * bg).sum(dim=-1)         # (B,3)
+                loss = (1.0 - cos_sim).mean()
 
-                loss_t = F.smooth_l1_loss(t_pred, t_gt)
-                loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
-                loss = loss_t + loss_R
-                rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
-                trans_err = ((t_pred - t_gt) * stats['train_t_scale'][0]).norm(dim=-1).mean()
                 forward_dict = {
                     "loss": loss,
-                    "loss_t": loss_t.detach(),
-                    "loss_R_rad": loss_R.detach(),
-                    "rot_err_deg": rot_err_deg,
-                    "trans_err": trans_err,
+                    "loss_basis": loss.detach(),
+                    "basis_cos": cos_sim.mean().detach(),
                 }
+                # t_pred = preds[:, 0:3]
+                # r6_pred = preds[:, 3:9]
+
+                # R_pred = rot6d_to_matrix(r6_pred, eps=1e-6)          # float32
+                # R_gt   = gt_extrinsic[:, :3, :3]
+                # t_gt   = gt_extrinsic[:, :3, 3]
+
+                # loss_t = F.smooth_l1_loss(t_pred, t_gt)
+                # loss_R = F.mse_loss(R_pred, R_gt)               # <- geodesic 대신 L2
+                # # loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
+                # loss = loss_t + loss_R
+                # with torch.no_grad():
+                #     rot_err_rad = geodesic_rot_loss(R_pred.float(), R_gt.float())
+                #     rot_err_deg = rot_err_rad.detach() * (180.0 / math.pi)
+                # # rot_err_deg = (loss_R.detach() * (180.0 / math.pi))
+                # trans_err = ((t_pred - t_gt) * stats['val_t_scale'][0]).norm(dim=-1).mean()
+                # forward_dict = {
+                #     "loss": loss,
+                #     "loss_t": loss_t.detach(),
+                #     "loss_R": loss_R.detach(),
+                #     "rot_err_deg": rot_err_deg,
+                #     "trans_err": trans_err,
+                # }
             loss.backward()
             torch.nn.utils.clip_grad_norm_(implicit_extrinsic_backbone.parameters(), max_norm=1.0)
             optimizer.step()
@@ -399,6 +438,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_depth_sim', default=False, type=str2bool, help='use depth input in backbone')
     parser.add_argument('--use_depth_model', default=False, type=str2bool, help='use depth input in backbone')
     parser.add_argument('--use_robot_eef_poses', default=False, type=str2bool, help='use robot eef position in backbone')
+    parser.add_argument('--pred_basis', default=False, type=str2bool, help='predict basis vectors instead of rotation matrix directly')
+    parser.add_argument('--debug', default=False, type=str2bool, help='debug mode for visualizing ')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name

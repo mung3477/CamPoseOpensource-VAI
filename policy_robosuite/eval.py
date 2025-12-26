@@ -135,6 +135,65 @@ class Evaluator:
 
         return intrinsics
 
+    def _get_motion_dynamics_basis(self, cam_to_world: np.ndarray):
+        """
+        cam_to_world: (4,4) camera pose matrix from pose_set (agentview).
+                    This is T_{w<-c} (world_from_camera).
+
+        Returns:
+            torch.Tensor (3,2) on CUDA:
+                [ [ux, vx],
+                [uy, vy],
+                [uz, vz] ]
+            each row is a unit 2D direction vector in image (u,v) space corresponding to
+            +X, +Y, +Z axes of the world/robot frame.
+        """
+
+        K = self._get_camera_intrinsics().astype(np.float32)  # (3,3)
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+
+        cam_to_world = np.asarray(cam_to_world, dtype=np.float32)
+        assert cam_to_world.shape == (4, 4)
+
+        # R_wc: world_from_cam rotation
+        R_wc = cam_to_world[:3, :3]          # (3,3)
+        # R_cw: cam_from_world rotation
+        R_cw = R_wc.T
+
+        # world/robot axes unit directions
+        dirs_w = np.stack([
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),  # +X
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),  # +Y
+            np.array([0.0, 0.0, 1.0], dtype=np.float32),  # +Z
+        ], axis=0)  # (3,3)
+
+        eps = 1e-8
+        basis_uv = np.zeros((3, 2), dtype=np.float32)
+
+        for i in range(3):
+            d_w = dirs_w[i]                       # (3,)
+            d_c = (R_cw @ d_w.reshape(3, 1)).reshape(3)  # (3,)
+
+            # homogeneous image direction (vanishing point)
+            p = (K @ d_c.reshape(3, 1)).reshape(3)  # (3,)
+            denom = float(p[2])
+            if abs(denom) < eps:
+                denom = eps if denom >= 0 else -eps
+
+            u = float(p[0] / denom)
+            v = float(p[1] / denom)
+
+            vec = np.array([u - cx, v - cy], dtype=np.float32)  # direction from principal point
+            n = float(np.linalg.norm(vec))
+            if n < eps:
+                # degenerate fallback
+                vec = p[:2].astype(np.float32)
+                n = float(np.linalg.norm(vec)) + eps
+
+            basis_uv[i] = vec / (n + eps)
+
+        return torch.from_numpy(basis_uv).float().cuda()
+
     def _set_camera_pose(self, cam_to_world):
         """Set camera pose in robosuite environment."""
 
@@ -167,6 +226,10 @@ class Evaluator:
             with torch.no_grad():
                 plucker_data = self.plucker_embedder(intrinsics_tensor, cam_to_world_tensor)
                 plucker_tensor = einops.rearrange(plucker_data['plucker'][0].cpu(), 'h w c -> c h w')
+            if self.args.use_dynamics_basis:
+                motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose).reshape(-1)  # (6,)
+                # expand to H,W
+                plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
         else:
             plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2])
         return torch.cat([rgb_tensor, plucker_tensor], dim=0)

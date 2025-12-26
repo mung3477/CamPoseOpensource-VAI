@@ -17,7 +17,9 @@ import torchvision.transforms as T
 from cam_embedding import PluckerEmbedder
 import torch.nn.functional as F
 from Depth_Anything_V2.depth_anything_v2.dpt import DepthAnythingV2
-
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 from eval import to_mp4
 
 # --- Utility Functions ---
@@ -353,6 +355,65 @@ class EpisodicDataset(Dataset):
     def __len__(self):
         return len(self.demo_indices)
 
+    def _get_motion_dynamics_basis(self, cam_to_world: np.ndarray):
+        """
+        cam_to_world: (4,4) camera pose matrix from pose_set (agentview).
+                    This is T_{w<-c} (world_from_camera).
+
+        Returns:
+            torch.Tensor (3,2) on CUDA:
+                [ [ux, vx],
+                [uy, vy],
+                [uz, vz] ]
+            each row is a unit 2D direction vector in image (u,v) space corresponding to
+            +X, +Y, +Z axes of the world/robot frame.
+        """
+
+        K = self._get_camera_intrinsics().astype(np.float32)  # (3,3)
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+
+        cam_to_world = np.asarray(cam_to_world, dtype=np.float32)
+        assert cam_to_world.shape == (4, 4)
+
+        # R_wc: world_from_cam rotation
+        R_wc = cam_to_world[:3, :3]          # (3,3)
+        # R_cw: cam_from_world rotation
+        R_cw = R_wc.T
+
+        # world/robot axes unit directions
+        dirs_w = np.stack([
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),  # +X
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),  # +Y
+            np.array([0.0, 0.0, 1.0], dtype=np.float32),  # +Z
+        ], axis=0)  # (3,3)
+
+        eps = 1e-8
+        basis_uv = np.zeros((3, 2), dtype=np.float32)
+
+        for i in range(3):
+            d_w = dirs_w[i]                       # (3,)
+            d_c = (R_cw @ d_w.reshape(3, 1)).reshape(3)  # (3,)
+
+            # homogeneous image direction (vanishing point)
+            p = (K @ d_c.reshape(3, 1)).reshape(3)  # (3,)
+            denom = float(p[2])
+            if abs(denom) < eps:
+                denom = eps if denom >= 0 else -eps
+
+            u = float(p[0] / denom)
+            v = float(p[1] / denom)
+
+            vec = np.array([u - cx, v - cy], dtype=np.float32)  # direction from principal point
+            n = float(np.linalg.norm(vec))
+            if n < eps:
+                # degenerate fallback
+                vec = p[:2].astype(np.float32)
+                n = float(np.linalg.norm(vec)) + eps
+
+            basis_uv[i] = vec / (n + eps)
+
+        return torch.from_numpy(basis_uv).float().cuda()
+
     def _get_camera_intrinsics(self):
         cam_name = "agentview"  # assume same intrinsics
         cam_id = self.env.sim.model.camera_name2id(cam_name)
@@ -416,6 +477,12 @@ class EpisodicDataset(Dataset):
                     plucker_tensor = einops.rearrange(plucker_data['plucker'][0], 'h w c -> c h w')
             else:
                 plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2], device='cuda')
+            if self.args.use_dynamics_basis:
+                motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose).reshape(-1)
+
+                # append as extra channels
+                # 6 * H * W
+                plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
 
             img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
             cam_images.append(self.transforms(img_chw))
@@ -448,10 +515,8 @@ class EpisodicDataset(Dataset):
 
         is_pad = np.zeros(self.max_seq_length, dtype=np.bool_)
         is_pad[seq_length:] = True
-
         state_normalized = (robot_qpos - self.norm_stats["state_mean"]) / self.norm_stats["state_std"]
         actions_normalized = (padded_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
-
         return {
             'image': image_tensor,
             'qpos': torch.from_numpy(state_normalized).float().cuda(),
@@ -582,6 +647,79 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
     def __len__(self):
         return len(self.demo_indices)
 
+    def _visualize_motion_dynamics_basis(
+        self,
+        rgb_tensor: torch.Tensor,
+        motion_dynamics_basis: torch.Tensor,
+        save_path: str | None = None,
+        show: bool = False,
+        origin: str = "pp",   # "pp" (principal point) or "center"
+        arrow_len: int = 60,
+    ):
+        """
+        Visualize motion dynamics basis (3,2) on top of rgb_tensor.
+
+        Args:
+            rgb_tensor: torch.Tensor (3,H,W) in [0,1], can be on cuda
+            motion_dynamics_basis: torch.Tensor (3,2) unit vectors in (du,dv)
+            save_path: if not None, save as image file
+            show: if True, matplotlib show
+            origin: "pp" uses principal point (cx,cy), "center" uses (W/2,H/2)
+            arrow_len: arrow length in pixels
+        """
+
+        # --- to uint8 RGB image ---
+        img = rgb_tensor[:3].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()  # HWC RGB
+        img_u8 = (img * 255.0).astype(np.uint8)
+
+        H, W = img_u8.shape[:2]
+
+        # --- choose origin ---
+        if origin == "pp":
+            K = self._get_camera_intrinsics()
+            ox, oy = int(round(float(K[0, 2]))), int(round(float(K[1, 2])))
+            # clamp just in case
+            ox = max(0, min(W - 1, ox))
+            oy = max(0, min(H - 1, oy))
+        elif origin == "center":
+            ox, oy = W // 2, H // 2
+        else:
+            raise ValueError(f"origin must be 'pp' or 'center', got {origin}")
+
+        basis = motion_dynamics_basis.detach().cpu().float().numpy()  # (3,2)
+
+        # --- draw arrows (OpenCV uses BGR) ---
+        img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: x=red, y=green, z=blue
+        labels = ["x", "y", "z"]
+
+        origin_xy = (ox, oy)
+        cv2.circle(img_bgr, origin_xy, 3, (255, 255, 255), -1)
+
+        for i in range(3):
+            du, dv = float(basis[i, 0]), -float(basis[i, 1])
+
+            # NOTE: if dv looks flipped, try dv = -dv
+            end_xy = (int(round(ox + arrow_len * du)), int(round(oy + arrow_len * dv)))
+
+            cv2.arrowedLine(img_bgr, origin_xy, end_xy, colors[i], 2, tipLength=0.2)
+            cv2.putText(img_bgr, labels[i], end_xy, cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 2)
+
+        out_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        if save_path is not None:
+            cv2.imwrite(save_path, cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR))
+            print(f"[viz] saved: {save_path}")
+
+        if show:
+            plt.figure()
+            plt.imshow(out_rgb)
+            plt.axis("off")
+            plt.show()
+
+        return out_rgb  # numpy RGB (H,W,3) uint8
+
     def _get_camera_intrinsics(self):
         cam_name = "agentview"  # assume same intrinsics
         cam_id = self.env.sim.model.camera_name2id(cam_name)
@@ -610,7 +748,10 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         self.env.sim.model.cam_quat[cam_id] = [quat[3], quat[0], quat[1], quat[2]]
 
     def _render_cur_scene(self, use_depth: bool = False):
-        rgb_img, depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=use_depth)
+        if use_depth:
+            rgb_img, depth_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=True)
+        else:
+            rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
         rgb_img = np.flipud(rgb_img).copy()
         rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
 
@@ -681,6 +822,64 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
 
 
+    def _get_motion_dynamics_basis(self, cam_to_world: np.ndarray):
+        """
+        cam_to_world: (4,4) camera pose matrix from pose_set (agentview).
+                    This is T_{w<-c} (world_from_camera).
+
+        Returns:
+            torch.Tensor (3,2) on CUDA:
+                [ [ux, vx],
+                [uy, vy],
+                [uz, vz] ]
+            each row is a unit 2D direction vector in image (u,v) space corresponding to
+            +X, +Y, +Z axes of the world/robot frame.
+        """
+
+        K = self._get_camera_intrinsics().astype(np.float32)  # (3,3)
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+
+        cam_to_world = np.asarray(cam_to_world, dtype=np.float32)
+        assert cam_to_world.shape == (4, 4)
+
+        # R_wc: world_from_cam rotation
+        R_wc = cam_to_world[:3, :3]          # (3,3)
+        # R_cw: cam_from_world rotation
+        R_cw = R_wc.T
+
+        # world/robot axes unit directions
+        dirs_w = np.stack([
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),  # +X
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),  # +Y
+            np.array([0.0, 0.0, 1.0], dtype=np.float32),  # +Z
+        ], axis=0)  # (3,3)
+
+        eps = 1e-8
+        basis_uv = np.zeros((3, 2), dtype=np.float32)
+
+        for i in range(3):
+            d_w = dirs_w[i]                       # (3,)
+            d_c = (R_cw @ d_w.reshape(3, 1)).reshape(3)  # (3,)
+
+            # homogeneous image direction (vanishing point)
+            p = (K @ d_c.reshape(3, 1)).reshape(3)  # (3,)
+            denom = float(p[2])
+            if abs(denom) < eps:
+                denom = eps if denom >= 0 else -eps
+
+            u = float(p[0] / denom)
+            v = float(p[1] / denom)
+
+            vec = np.array([u - cx, v - cy], dtype=np.float32)  # direction from principal point
+            n = float(np.linalg.norm(vec))
+            if n < eps:
+                # degenerate fallback
+                vec = p[:2].astype(np.float32)
+                n = float(np.linalg.norm(vec)) + eps
+
+            basis_uv[i] = vec / (n + eps)
+
+        return torch.from_numpy(basis_uv).float().cuda()
 
     def __getitem__(self, demo_idx):
         demo_length = self.demo_lengths[demo_idx]
@@ -697,7 +896,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
         robot_eef_pos_list = []
         pose_set = self._get_pose_set(demo_idx)
-
+        motion_dynamics_basis_list = []
         start_ts_list = np.random.choice(
             demo_length,
             size=self.num_dynamic_feature,
@@ -716,6 +915,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     cam_pose = np.array(cam_pose_raw)
                     self._set_camera_pose(cam_pose)
                 self.env.sim.forward()
+                motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose)  # (3,2)
                 robot_eef_pos = self.env._get_observations()['robot0_eef_pos']
                 rgb_tensor, depth_tensor = self._render_cur_scene(use_depth=self.use_depth_sim)
 
@@ -739,6 +939,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                 if self.use_depth_sim:
                     depth_images.append(depth_tensor)
                     future_depth_images.append(future_depth_tensor)
+                motion_dynamics_basis_list.append(motion_dynamics_basis)
             robot_eef_pos_list.append([np.concatenate([robot_eef_pos, future_robot_eef_pos])])
             # Stack per-camera images: [num_cameras, C, H, W]
             dynamic_actions.append(dynamic_action)
@@ -761,6 +962,8 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         dynamic_actions = np.array(dynamic_actions)
         dynamic_actions_normalized = (dynamic_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         robot_eef_poses = np.array(robot_eef_pos_list)
+        motion_dynamics_basis_tensor = torch.stack(motion_dynamics_basis_list, dim=0)
+
         # Calculate optical flow features
         image_tensor = torch.stack(cam_images, dim=0)
         future_image_tensor = torch.stack(future_cam_images, dim=0)
@@ -776,13 +979,29 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                 depth1 = self.depth_backbone(img1_for_depth).unsqueeze(1)
                 depth2 = self.depth_backbone(img2_for_depth).unsqueeze(1)
                 optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
-                # self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
             elif self.use_depth_sim:
                 depth1 = torch.stack(depth_images, dim=0)
                 depth2 = torch.stack(future_depth_images, dim=0)
                 depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+
+            if self.args.debug:
+                self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
+                for i in range(2):
+                    save_path = f"debug/basis_demo{demo_idx}_ts{start_ts}_i{idx}_{i}.png"
+                    if i == 0:
+                        image_to_viz = image_tensor[idx]
+                    else:
+                        image_to_viz = future_image_tensor[idx]
+                    self._visualize_motion_dynamics_basis(
+                        rgb_tensor=image_to_viz,
+                        motion_dynamics_basis=motion_dynamics_basis_tensor[0],
+                        save_path=save_path,
+                        show=False,
+                        origin="pp",   # or "center"
+                        arrow_len=70,
+                    )
 
         return {
             'image': image_tensor,
@@ -791,6 +1010,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
             'robot_eef_poses': torch.from_numpy(robot_eef_poses).float().cuda(),
             'cam_extrinsics': cam_extrinsics,
             "optical_flow": optical_flow,
+            "motion_dynamics_basis_tensor": motion_dynamics_basis_tensor
         }
 
     def __del__(self):
