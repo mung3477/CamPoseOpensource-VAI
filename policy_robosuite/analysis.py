@@ -25,7 +25,7 @@ def get_last_n_ckpt_eval_results(ckpt_dir: str, n: int, dataset_type: _DatasetTy
     eval_results = []
     for ckpt_name in ckpt_names:
         ckpt_name_base = ckpt_name.replace('.pth', '')
-        eval_results.append(eval_result_name_template.format(ckpt_name_base=ckpt_name_base))
+        eval_results.append(eval_result_name_template.format(ckpt_name_base=ckpt_name_base, dataset_type=dataset_type))
 
     return eval_results
 
@@ -76,9 +76,12 @@ if __name__ == "__main__":
         default="/root/Desktop/workspace/CamPoseOpensource-VAI/policy_robosuite/checkpoints/train_dp_use_plucker_liftrand_eef_delta",
         help="Path to the checkpoint directory"
     )
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n", type=int, default=10, help="Number of checkpoints to evaluate")
     parser.add_argument("--dataset", type=str, default="test", choices=["train", "test"])
 
     args = parser.parse_args()
+    task = args.ckpt_dir.split("/")[-1]
 
+    print(f"---- Success Rates for {args.n} {args.dataset} checkpoints trained on seed {args.seed} for {task} ----")
     calc_success_rate(args.ckpt_dir, args.n, args.dataset)
