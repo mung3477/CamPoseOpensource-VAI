@@ -6,3 +6,6 @@ hf_weights/
 unimatch/
 *.png
 debug/
+*.log
+
+*.zip

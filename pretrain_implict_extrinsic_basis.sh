@@ -13,7 +13,11 @@ CUDA_VISIBLE_DEVICES=0 python policy_robosuite/pretrain_implicit_extrinsic_basis
 --use_linear_prob "1" \
 --num_dynamic_feature 3 \
 --window_size 5 \
+<<<<<<< HEAD
 --batch_size 2 \
+=======
+--batch_size 128 \
+>>>>>>> 22bf1df9b3698434325ab548a9245df7aca5c0f9
 --lr 3e-3 \
 --seed 0 \
 --num_epochs 1000 \

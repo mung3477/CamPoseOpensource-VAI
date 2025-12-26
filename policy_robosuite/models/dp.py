@@ -56,16 +56,17 @@ class SpatialSoftmax(nn.Module):
 
 
 class RgbEncoder(nn.Module):
-    def __init__(self, image_shape=(3, 256, 256), backbone="resnet18", use_group_norm: bool = True, num_keypoints: int = 32, use_plucker: bool = False):
+    def __init__(self, image_shape=(3, 256, 256), backbone="resnet18", use_group_norm: bool = True, num_keypoints: int = 32, use_plucker: bool = False, use_dynamic_basis_channel: bool = False):
         super().__init__()
         self.use_plucker = use_plucker
+        self.use_dynamic_basis_channel = use_dynamic_basis_channel
         backbone_model = getattr(torchvision.models, backbone)(weights=None)
 
         # Modify first conv layer for Plucker if needed
-        if use_plucker:
+        if use_plucker or use_dynamic_basis_channel:
             original_conv = backbone_model.conv1
             backbone_model.conv1 = nn.Conv2d(
-                9,  # 3 RGB + 6 Plucker channels
+                image_shape[0],  # 3 RGB + 6 Plucker channels
                 original_conv.out_channels,
                 kernel_size=original_conv.kernel_size,
                 stride=original_conv.stride,
@@ -84,7 +85,7 @@ class RgbEncoder(nn.Module):
         with torch.no_grad():
             # Adjust dummy tensor channels based on use_plucker
             if use_plucker:
-                dummy_shape = (1, 9, image_shape[1], image_shape[2])  # 9 channels for Plucker
+                dummy_shape = (1, image_shape[0], image_shape[1], image_shape[2])  # 9 channels for Plucker
             else:
                 dummy_shape = (1, *image_shape)
             dummy = torch.zeros(dummy_shape)
@@ -327,11 +328,18 @@ class DiffusionPolicy(nn.Module):
         # cameras and image encoder
         image_h, image_w = 256, 256
         use_plucker = args.use_plucker
-        image_c = 9 if use_plucker else 3  # 9 channels for Plucker (RGB + 6), 3 for RGB only
+        use_dynamic_basis_channel = (not args.use_overlay_basis) and args.use_dynamics_basis
+        if use_plucker:
+            image_c = 9  # 3 (RGB) + 6 (Plucker)
+        else:
+            image_c = 3  # RGB only
+        if use_dynamic_basis_channel:
+            image_c = 6  # 3 (RGB) + 3 (dynamics basis)
         # Use explicit num_side_cam from args
         num_cameras = int(args.num_side_cam)
         self.use_plucker = use_plucker
-        self.rgb_encoder = RgbEncoder(image_shape=(image_c, image_h, image_w), backbone="resnet18", use_group_norm=True, num_keypoints=32, use_plucker=use_plucker)
+        self.use_dynamic_basis_channel = use_dynamic_basis_channel
+        self.rgb_encoder = RgbEncoder(image_shape=(image_c, image_h, image_w), backbone="resnet18", use_group_norm=True, num_keypoints=32, use_plucker=use_plucker, use_dynamic_basis_channel=use_dynamic_basis_channel)
         image_feat_dim_total = self.rgb_encoder.feature_dim * num_cameras * n_obs_steps
 
         # Conditional UNet mirroring original DP shapes
@@ -369,8 +377,6 @@ class DiffusionPolicy(nn.Module):
         betas = (0.9, 0.999)
         self.optimizer = torch.optim.AdamW(self.parameters(), lr=float(args.lr), betas=betas, weight_decay=float(args.weight_decay))
 
-        # Dynamics Embedding
-        self.use_dynamic_feature = args.use_dynamic_feature
 
     def configure_optimizers(self):
         return self.optimizer
@@ -381,7 +387,6 @@ class DiffusionPolicy(nn.Module):
         images = data_dict["image"].to(device)  # (B, N, C, H, W)
         B = qpos.shape[0]
         T = self.horizon
-
         # local_cond: (B, T, obs_dim) — replicate current proprio across horizon
         local_cond = qpos.unsqueeze(1).expand(B, T, self.obs_dim)
 
@@ -390,8 +395,8 @@ class DiffusionPolicy(nn.Module):
         if not self.use_plucker and images.size(2) > 3:
             # If not using Plucker, only use RGB channels
             images = images[:, :, :3, ...]
-        elif self.use_plucker and images.size(2) != 9:
-            raise ValueError(f"When use_plucker=True, expected 9 channels (RGB + 6 Plucker) but got {images.size(2)}")
+        elif (self.use_plucker and images.size(2) != 9) and (self.use_dynamic_basis_channel and images.size(2) != 6):
+            raise ValueError(f"When use_plucker=True, expected 9 channels (RGB + 6 Plucker) but got {images.size(2)} or When use_dynamic_basis_channel=True, expected 6 channels (RGB + 3 basis) but got {images.size(2)}")
 
         # Ensure we actually have the expected number of cameras; if more were provided,
         # keep the first self.num_cameras.
@@ -402,10 +407,6 @@ class DiffusionPolicy(nn.Module):
         img_feats = self.rgb_encoder(img_bsnchw)  # ((B*N), F)
         img_feats = einops.rearrange(img_feats, "(b n) f -> b (n f)", b=B, n=self.num_cameras)
         global_cond = img_feats  # (B, N*F)
-
-        # Dynamics Embeddings
-        if self.use_dynamic_feature:
-            pass
 
         return local_cond, global_cond
 
