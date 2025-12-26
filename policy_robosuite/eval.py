@@ -9,7 +9,9 @@ import h5py
 from scipy.spatial.transform import Rotation
 import torchvision.transforms.functional as TF
 from cam_embedding import PluckerEmbedder
-
+from viz_utils import project_world_point_to_pixel_cam_to_world, _extract_eef_world_pos, draw_clipped_arrow_fixed_head
+import cv2
+import argparse
 
 def to_mp4(save_path, image_list, reward_list=None, success_list=None, info_list=None):
     """
@@ -192,7 +194,112 @@ class Evaluator:
 
             basis_uv[i] = vec / (n + eps)
 
-        return torch.from_numpy(basis_uv).float().cuda()
+        return torch.from_numpy(basis_uv).float()
+
+    def make_motion_basis_axis_rgb_tensor_cam_to_world(
+        self,
+        rgb_tensor: torch.Tensor,                  # (3,H,W) in [0,1]
+        motion_dynamics_basis: torch.Tensor,        # (3,2) or (6,)
+        cam_to_world: np.ndarray | torch.Tensor | None = None,   # (4,4)
+        robot_eef_abs_poses: np.ndarray | torch.Tensor | None = None,
+        origin_robot: bool = False,               # True면 eef 위치를 origin으로 사용
+        origin_fallback: str = "pp",               # "pp" or "center"
+        arrow_len: int = 60,
+        line_thickness: int = 2,
+        return_overlay: bool = False,              # True면 rgb 위에 그려서 반환
+        overlay_alpha: float = 0.85,
+    ):
+        """
+        Returns:
+        axis_tensor: (3,H,W) float in [0,1] on same device as rgb_tensor
+        origin_xy: (ox,oy) int tuple
+        """
+        H, W = int(rgb_tensor.shape[1]), int(rgb_tensor.shape[2])
+
+        # basis -> (3,2) numpy
+        if motion_dynamics_basis.ndim == 1:
+            basis = motion_dynamics_basis.view(3, 2)
+        else:
+            basis = motion_dynamics_basis
+        basis_np = basis.detach().float().cpu().numpy()
+
+        # 1) origin from EEF projection if available
+        ox = oy = None
+        if origin_robot==True and cam_to_world is not None and robot_eef_abs_poses is not None:
+            if isinstance(cam_to_world, torch.Tensor):
+                c2w = cam_to_world.detach().cpu().numpy()
+            else:
+                c2w = np.asarray(cam_to_world)
+
+            if c2w.shape != (4, 4):
+                raise ValueError(f"cam_to_world must be (4,4), got {c2w.shape}")
+
+            K = self._get_camera_intrinsics()
+            p_world = _extract_eef_world_pos(robot_eef_abs_poses)
+            uv = project_world_point_to_pixel_cam_to_world(K, c2w, p_world)
+            # uv = project_world_point_to_pixel_CU_cam_to_world(K, c2w, p_world)
+            if uv is not None:
+                u, v = uv
+                ox = int(round(u)); oy = int(round(v))
+                ox = max(0, min(W - 1, ox))
+                oy = max(0, min(H - 1, oy))
+
+        # 2) fallback origin
+        if ox is None or oy is None:
+            if origin_fallback == "pp":
+                K = self._get_camera_intrinsics()
+                ox, oy = int(round(float(K[0, 2]))), int(round(float(K[1, 2])))
+                ox = max(0, min(W - 1, ox))
+                oy = max(0, min(H - 1, oy))
+            elif origin_fallback == "center":
+                ox, oy = W // 2, H // 2
+            else:
+                raise ValueError(f"origin_fallback must be 'pp' or 'center'")
+
+        # draw base
+        if return_overlay:
+            base_rgb = (rgb_tensor[:3].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        else:
+            base_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+        img_bgr = cv2.cvtColor(base_rgb, cv2.COLOR_RGB2BGR)
+
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: x=red y=green z=blue
+        labels = ["x", "y", "z"]
+
+        origin_xy = (ox, oy)
+        cv2.circle(img_bgr, origin_xy, 3, (255, 255, 255), -1)
+
+        for i in range(3):
+            du = float(basis_np[i, 0])
+            dv = -float(basis_np[i, 1])  # image v-axis flip
+
+            end_xy = (int(round(ox + arrow_len * du)),
+                    int(round(oy + arrow_len * dv)))
+
+            ok, c0, c1 = draw_clipped_arrow_fixed_head(
+                img_bgr,
+                origin_xy,
+                end_xy,
+                colors[i],
+                thickness=line_thickness,
+                head_len_px=8,   # ✅ 여기서 머리 크기 조절 (픽셀)
+                head_w_px=6,
+            )
+            # cv2.arrowedLine(img_bgr, origin_xy, end_xy, colors[i], line_thickness, tipLength=0.01)
+            # cv2.putText(img_bgr, labels[i], end_xy, cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 2)
+
+        out_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # uint8
+
+        if return_overlay:
+            # optional smoother blending with original rgb
+            rgb_u8 = (rgb_tensor[:3].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+            out_rgb = (overlay_alpha * out_rgb + (1.0 - overlay_alpha) * rgb_u8).astype(np.uint8)
+
+        axis_tensor = torch.from_numpy(out_rgb).float().permute(2, 0, 1) / 255.0
+        axis_tensor = axis_tensor.to(device=rgb_tensor.device)
+
+        return axis_tensor, (ox, oy)
 
     def _set_camera_pose(self, cam_to_world):
         """Set camera pose in robosuite environment."""
@@ -226,10 +333,32 @@ class Evaluator:
             with torch.no_grad():
                 plucker_data = self.plucker_embedder(intrinsics_tensor, cam_to_world_tensor)
                 plucker_tensor = einops.rearrange(plucker_data['plucker'][0].cpu(), 'h w c -> c h w')
+
             if self.args.use_dynamics_basis:
                 motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose).reshape(-1)  # (6,)
+                sid = self.env.sim.model.site_name2id("gripper0_right_grip_site")
+                robot_eef_pos = self.env.sim.data.site_xpos[sid].copy()
+                axis_tensor, origin_xy = self.make_motion_basis_axis_rgb_tensor_cam_to_world(
+                    rgb_tensor=rgb_tensor,                  # (3,H,W)
+                    motion_dynamics_basis=motion_dynamics_basis,
+                    cam_to_world=cam_pose,                  # cam_pose = cam_to_world (고정)
+                    robot_eef_abs_poses=robot_eef_pos,  # 네가 가진 eef pose
+                    origin_robot=self.args.use_basis_origin_robot,
+                    origin_fallback="pp",
+                    arrow_len=60,
+                    return_overlay=self.args.use_overlay_basis,
+                )
+                if self.args.use_overlay_basis:
+                    rgb_tensor = axis_tensor
+                else:
+                    if self.args.use_plucker:
+                        # append as extra channels
+                        # 3 (RGB) + 6 (Plucker) + 3 (basis) = 12 channels
+                        plucker_tensor = axis_tensor
+                    else:
+                        assert False, "Either use_plucker or use_dynamics_basis must be True"
                 # expand to H,W
-                plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
+                # plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
         else:
             plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2])
         return torch.cat([rgb_tensor, plucker_tensor], dim=0)

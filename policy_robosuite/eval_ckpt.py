@@ -59,13 +59,6 @@ def main(args, ckpt=None):
         args=args,
         env=env
     )
-
-    # Save stats
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    stats_path = os.path.join(args.ckpt_dir, 'dataset_stats.json')
-    with open(stats_path, 'w') as f:
-        json.dump({k: v.tolist() for k, v in stats.items()}, f, indent=4)
-
     evaluator = Evaluator(env=env, norm_stats=stats, dataset_path=args.dataset_path, args=args)
 
     if args.policy_class == 'act':
@@ -75,122 +68,48 @@ def main(args, ckpt=None):
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
 
-    optimizer = policy.configure_optimizers()
-    if args.policy_class == 'smolvla':
-        steps_per_epoch = len(train_dataloader)
-        total_steps = args.num_epochs * steps_per_epoch
-        scheduler = cosine_schedule_with_warmup(optimizer, 0.05 * total_steps, total_steps)
-    else:
-        scheduler = constant_schedule(optimizer)
-
-
     epoch = 0
     if ckpt is not None:
         policy.load_state_dict(ckpt['model_state_dict'])
-        if 'optimizer_state_dict' in ckpt:
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        epoch = ckpt['epoch'] + 1
+        epoch = ckpt['epoch']
         print(f"Resumed from checkpoint at epoch {ckpt['epoch']}")
 
-    pbar = tqdm.tqdm(total=args.num_epochs, desc="Training")
-    pbar.update(epoch)
 
-    while epoch < args.num_epochs:
+    # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
+    if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
+        print("⚠️  Render fault detected; rebuilding context")
+        env.reset()
 
-        # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
-        if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
-            print("⚠️  Render fault detected; rebuilding context")
-            env.reset()
+    # Evaluation
+    policy.eval()
+    for pose_file in args.pose_files:
+        pose_name = pose_file[:-5]  # Remove .json extension
+        eval_save_path = os.path.join(args.ckpt_dir, f"eval_epoch_{epoch}_{pose_name}")
+        os.makedirs(eval_save_path, exist_ok=True)
+        evaluator.success_by_seed = {}
 
-        # Validation
-        if epoch % 10 == 0:
-            with torch.inference_mode():
-                policy.eval()
-                epoch_dicts = []
-                for data in val_dataloader:
-                    with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                        forward_dict = policy(data)
-                    epoch_dicts.append(forward_dict)
-                epoch_summary = compute_dict_mean(epoch_dicts)
-                for k, v in epoch_summary.items():
-                    wandb.log({f'val_{k}': v.item()}, step=epoch)
+        success_rates = []
+        for episode_idx in range(50 if epoch > args.eval_start_epoch else args.eval_episodes):
+            with torch.no_grad():
+                _, success_rate, _ = evaluator.evaluate(
+                    policy=policy,
+                    save_path=eval_save_path,
+                    video_prefix=f"epoch_{epoch}_episode_{episode_idx}",
+                    pose_name=pose_name,
+                    episode_num=episode_idx
+                )
+            success_rates.append(success_rate)
+        avg_success_rate = sum(success_rates) / len(success_rates)
+        wandb.log({f'success_rate_{pose_name}': avg_success_rate}, step=epoch)
 
-        # Evaluation
-        if epoch % args.eval_every == 0:
-            policy.eval()
-            for pose_file in args.pose_files:
-                pose_name = pose_file[:-5]  # Remove .json extension
-                eval_save_path = os.path.join(args.ckpt_dir, f"eval_epoch_{epoch}_{pose_name}")
-                os.makedirs(eval_save_path, exist_ok=True)
-                evaluator.success_by_seed = {}
+        with open(os.path.join(eval_save_path, 'success_by_seed.json'), 'w') as f:
+            json.dump(evaluator.success_by_seed, f, indent=2)
 
-                success_rates = []
-                for episode_idx in range(50 if epoch > args.eval_start_epoch else args.eval_episodes):
-                    with torch.no_grad():
-                        _, success_rate, _ = evaluator.evaluate(
-                            policy=policy,
-                            save_path=eval_save_path,
-                            video_prefix=f"epoch_{epoch}_episode_{episode_idx}",
-                            pose_name=pose_name,
-                            episode_num=episode_idx
-                        )
-                    success_rates.append(success_rate)
-                avg_success_rate = sum(success_rates) / len(success_rates)
-                wandb.log({f'success_rate_{pose_name}': avg_success_rate}, step=epoch)
+    # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
+    if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
+        print("⚠️  Render fault detected; rebuilding context")
+        env.reset()
 
-                with open(os.path.join(eval_save_path, 'success_by_seed.json'), 'w') as f:
-                    json.dump(evaluator.success_by_seed, f, indent=2)
-
-        # Save checkpoint
-        if epoch % args.save_every == 0:
-            checkpoint_path = os.path.join(args.ckpt_dir, f'epoch_{epoch}.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': policy.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': epoch_summary['loss'],
-                'wandb_id': wandb.run.id
-            }, checkpoint_path)
-            cleanup_ckpt(args.ckpt_dir, keep=10)  # Keep last 10 checkpoints
-
-            # No Timeout
-            # if time.time() - start_time > 7.5 * 60 * 60:
-            #     print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
-            #     break
-
-        # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
-        if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
-            print("⚠️  Render fault detected; rebuilding context")
-            env.reset()
-
-        # Training
-        train_history = []
-        policy.train()
-        for data in train_dataloader:
-
-            with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                forward_dict = policy(data)
-                loss = forward_dict['loss']
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-            optimizer.step()
-            wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=epoch)
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            train_history.append(detach_dict(forward_dict))
-
-        epoch_summary = compute_dict_mean(train_history)
-        for k, v in epoch_summary.items():
-            wandb.log({f'train_{k}': v.item()}, step=epoch)
-
-        pbar.update(1)
-        epoch += 1
-
-    pbar.close()
     env.close()
     wandb.finish()
 
@@ -273,8 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_expert_only', type=str2bool, default=False, help='train only the action expert; freeze VLM')
     parser.add_argument('--use_dynamic_feature', type=str2bool, default=False, help='use dynamic feature')
     parser.add_argument('--use_dynamics_basis', type=str2bool, default=False, help='use dynamics basis model')
-    parser.add_argument('--use_overlay_basis', type=str2bool, default=False, help='overlay motion basis on RGB image')
-    parser.add_argument('--use_basis_origin_robot', type=str2bool, default=False, help='use robot eef as origin for motion basis visualization')
+    parser.add_argument('--ckpt_path', type=str, default=None, help='Path to checkpoint to load')
     args = parser.parse_args()
 
     group = args.name[:-7] # remove the seed from the name
@@ -300,15 +218,14 @@ if __name__ == '__main__':
         json.dump(vars(args), f, indent=4)
 
     # Check for existing checkpoint to resume
-    ckpt_path = get_last_ckpt(args.ckpt_dir)
+    # ckpt_path = get_last_ckpt(args.ckpt_dir)
+    ckpt_path = args.ckpt_path
 
     if ckpt_path is not None:
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path)
         wandb_id = ckpt['wandb_id']
-        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, id=wandb_id, resume='must', group=group)
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, name=args.name, config=vars(args), group=group)
         main(args, ckpt)
     else:
-        print(f"Starting new training run: {args.name}")
-        wandb.init(entity=args.wandb_entity, project=args.wandb_project_name, name=args.name, config=vars(args), group=group)
-        main(args)
+        assert False, "Checkpoint path must be provided for evaluation."

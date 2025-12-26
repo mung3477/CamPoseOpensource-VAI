@@ -7,3 +7,5 @@ unimatch/
 *.png
 debug/
 *.log
+
+*.zip

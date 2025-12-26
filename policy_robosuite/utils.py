@@ -7,6 +7,8 @@ import re
 import math
 import glob
 import json
+from typing import List
+
 import einops
 from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset, DataLoader
@@ -19,10 +21,88 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from eval import to_mp4
+from viz_utils import project_world_point_to_pixel_cam_to_world, _extract_eef_world_pos, draw_clipped_arrow_fixed_head
+
 
 # --- Utility Functions ---
 
 from torchvision.utils import save_image
+
+def show_axis_tensor(axis_tensor: torch.Tensor,
+                     rgb_tensor: torch.Tensor | None = None,
+                     origin_xy: tuple[int, int] | None = None,
+                     overlay_alpha: float = 0.7,
+                     title: str = "axis_tensor",
+                     show: bool = True,
+                     save_path: str | None = None):
+    """
+    axis_tensor: (3,H,W) float [0,1]
+    rgb_tensor:  (3,H,W) float [0,1]  (optional) overlay 용
+    origin_xy: (ox, oy) in pixel coords  (optional)
+    """
+
+    def to_hwc_u8(x: torch.Tensor) -> np.ndarray:
+        x = x.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+        return (x * 255.0).astype(np.uint8)
+
+    axis_u8 = to_hwc_u8(axis_tensor)
+
+    if rgb_tensor is None:
+        vis_u8 = axis_u8
+    else:
+        rgb_u8 = to_hwc_u8(rgb_tensor[:3])
+        vis_u8 = (overlay_alpha * axis_u8 + (1.0 - overlay_alpha) * rgb_u8).astype(np.uint8)
+
+    # origin 점 찍기(원하면)
+    if origin_xy is not None:
+        ox, oy = origin_xy
+        H, W = vis_u8.shape[:2]
+        ox = max(0, min(W - 1, int(ox)))
+        oy = max(0, min(H - 1, int(oy)))
+        # 하얀 점 (3x3)
+        vis_u8[max(0, oy-1):min(H, oy+2), max(0, ox-1):min(W, ox+2), :] = 255
+
+    plt.figure()
+    plt.imshow(vis_u8)
+    plt.axis("off")
+    plt.title(title)
+
+    if save_path is not None:
+        plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
+        print(f"[viz] saved: {save_path}")
+
+    if show:
+        plt.show()
+
+    return vis_u8
+
+def save_rgb_image(rgb_b3hw: torch.Tensor, path: str):
+    """
+    Save a normalized RGB tensor as an 8-bit PNG/JPG.
+
+    Args:
+        rgb_b3hw: torch.Tensor (B,3,H,W) or (3,H,W), normalized in [0,1]
+        path: output file path (e.g., "/tmp/img.png")
+    """
+    x = rgb_b3hw.detach().float().cpu()
+
+    # allow (3,H,W) or (B,3,H,W)
+    if x.ndim == 3:
+        x = x.unsqueeze(0)
+    if x.ndim != 4 or x.shape[1] != 3:
+        raise ValueError(f"Expected (B,3,H,W) or (3,H,W), got {tuple(x.shape)}")
+
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+
+    x0 = x[0]  # (3,H,W)
+    x0 = x0.clamp(0.0, 1.0)
+
+    # (3,H,W) -> (H,W,3) uint8
+    img_hwc = (x0.permute(1, 2, 0).numpy() * 255.0 + 0.5).astype(np.uint8)
+
+    # save (cv2 expects BGR)
+    img_bgr = cv2.cvtColor(img_hwc, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(path, img_bgr)
 
 def save_depth_gray(depth_b1hw: torch.Tensor, path: str):
     d = depth_b1hw.detach().float().cpu()
@@ -101,6 +181,18 @@ def get_last_ckpt(ckpt_dir):
                 latest_ckpt = ckpt
 
     return latest_ckpt
+
+def get_all_ckpts(ckpt_dir)->List | None:
+    """Get the latest checkpoint in the directory."""
+    if not os.path.exists(ckpt_dir):
+        return None
+
+    ckpts = glob.glob(os.path.join(ckpt_dir, "epoch_*.pth"))
+    ckpts.sort()
+    if not ckpts:
+        return None
+
+    return ckpts
 
 def cosine_schedule(optimizer, total_steps, eta_min=0.0):
     """Cosine learning rate schedule."""
@@ -341,6 +433,111 @@ class EpisodicDataset(Dataset):
     def __len__(self):
         return len(self.demo_indices)
 
+    def make_motion_basis_axis_rgb_tensor_cam_to_world(
+        self,
+        rgb_tensor: torch.Tensor,                  # (3,H,W) in [0,1]
+        motion_dynamics_basis: torch.Tensor,        # (3,2) or (6,)
+        cam_to_world: np.ndarray | torch.Tensor | None = None,   # (4,4)
+        robot_eef_abs_poses: np.ndarray | torch.Tensor | None = None,
+        origin_robot: bool = False,               # True면 eef 위치를 origin으로 사용
+        origin_fallback: str = "pp",               # "pp" or "center"
+        arrow_len: int = 60,
+        line_thickness: int = 2,
+        return_overlay: bool = False,              # True면 rgb 위에 그려서 반환
+        overlay_alpha: float = 0.85,
+    ):
+        """
+        Returns:
+        axis_tensor: (3,H,W) float in [0,1] on same device as rgb_tensor
+        origin_xy: (ox,oy) int tuple
+        """
+        H, W = int(rgb_tensor.shape[1]), int(rgb_tensor.shape[2])
+
+        # basis -> (3,2) numpy
+        if motion_dynamics_basis.ndim == 1:
+            basis = motion_dynamics_basis.view(3, 2)
+        else:
+            basis = motion_dynamics_basis
+        basis_np = basis.detach().float().cpu().numpy()
+
+        # 1) origin from EEF projection if available
+        ox = oy = None
+        if origin_robot==True and cam_to_world is not None and robot_eef_abs_poses is not None:
+            if isinstance(cam_to_world, torch.Tensor):
+                c2w = cam_to_world.detach().cpu().numpy()
+            else:
+                c2w = np.asarray(cam_to_world)
+
+            if c2w.shape != (4, 4):
+                raise ValueError(f"cam_to_world must be (4,4), got {c2w.shape}")
+
+            K = self._get_camera_intrinsics()
+            p_world = _extract_eef_world_pos(robot_eef_abs_poses)
+            uv = project_world_point_to_pixel_cam_to_world(K, c2w, p_world)
+            # uv = project_world_point_to_pixel_CU_cam_to_world(K, c2w, p_world)
+            if uv is not None:
+                u, v = uv
+                ox = int(round(u)); oy = int(round(v))
+                ox = max(0, min(W - 1, ox))
+                oy = max(0, min(H - 1, oy))
+
+        # 2) fallback origin
+        if ox is None or oy is None:
+            if origin_fallback == "pp":
+                K = self._get_camera_intrinsics()
+                ox, oy = int(round(float(K[0, 2]))), int(round(float(K[1, 2])))
+                ox = max(0, min(W - 1, ox))
+                oy = max(0, min(H - 1, oy))
+            elif origin_fallback == "center":
+                ox, oy = W // 2, H // 2
+            else:
+                raise ValueError(f"origin_fallback must be 'pp' or 'center'")
+
+        # draw base
+        if return_overlay:
+            base_rgb = (rgb_tensor[:3].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        else:
+            base_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+        img_bgr = cv2.cvtColor(base_rgb, cv2.COLOR_RGB2BGR)
+
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: x=red y=green z=blue
+        labels = ["x", "y", "z"]
+
+        origin_xy = (ox, oy)
+        cv2.circle(img_bgr, origin_xy, 3, (255, 255, 255), -1)
+
+        for i in range(3):
+            du = float(basis_np[i, 0])
+            dv = -float(basis_np[i, 1])  # image v-axis flip
+
+            end_xy = (int(round(ox + arrow_len * du)),
+                    int(round(oy + arrow_len * dv)))
+
+            ok, c0, c1 = draw_clipped_arrow_fixed_head(
+                img_bgr,
+                origin_xy,
+                end_xy,
+                colors[i],
+                thickness=line_thickness,
+                head_len_px=8,   # ✅ 여기서 머리 크기 조절 (픽셀)
+                head_w_px=6,
+            )
+            # cv2.arrowedLine(img_bgr, origin_xy, end_xy, colors[i], line_thickness, tipLength=0.01)
+            # cv2.putText(img_bgr, labels[i], end_xy, cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 2)
+
+        out_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)  # uint8
+
+        if return_overlay:
+            # optional smoother blending with original rgb
+            rgb_u8 = (rgb_tensor[:3].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+            out_rgb = (overlay_alpha * out_rgb + (1.0 - overlay_alpha) * rgb_u8).astype(np.uint8)
+
+        axis_tensor = torch.from_numpy(out_rgb).float().permute(2, 0, 1) / 255.0
+        axis_tensor = axis_tensor.to(device=rgb_tensor.device)
+
+        return axis_tensor, (ox, oy)
+
     def _get_motion_dynamics_basis(self, cam_to_world: np.ndarray):
         """
         cam_to_world: (4,4) camera pose matrix from pose_set (agentview).
@@ -453,7 +650,8 @@ class EpisodicDataset(Dataset):
             rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
             rgb_img = np.flipud(rgb_img).copy()
             rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
-
+            sid = self.env.sim.model.site_name2id("gripper0_right_grip_site")
+            robot_eef_pos = self.env.sim.data.site_xpos[sid].copy()
             if self.use_plucker and not self.args.default_cam:
                 intrinsics = self._get_camera_intrinsics()
                 intrinsics_tensor = torch.from_numpy(intrinsics).unsqueeze(0).float().cuda()
@@ -463,12 +661,33 @@ class EpisodicDataset(Dataset):
                     plucker_tensor = einops.rearrange(plucker_data['plucker'][0], 'h w c -> c h w')
             else:
                 plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2], device='cuda')
+
             if self.args.use_dynamics_basis:
                 motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose).reshape(-1)
                 
+                axis_tensor, origin_xy = self.make_motion_basis_axis_rgb_tensor_cam_to_world(
+                    rgb_tensor=rgb_tensor,                  # (3,H,W)
+                    motion_dynamics_basis=motion_dynamics_basis,
+                    cam_to_world=cam_pose,                  # cam_pose = cam_to_world (고정)
+                    robot_eef_abs_poses=robot_eef_pos,  # 네가 가진 eef pose
+                    origin_robot=self.args.use_basis_origin_robot,
+                    origin_fallback="pp",
+                    arrow_len=60,
+                    return_overlay=self.args.use_overlay_basis,
+                )
+                if self.args.use_overlay_basis:
+                    rgb_tensor = axis_tensor
+                else:
+                    if self.args.use_plucker:
+                        # append as extra channels
+                        # 3 (RGB) + 6 (Plucker) + 3 (basis) = 12 channels
+                        plucker_tensor = axis_tensor
+                    else:
+                        assert False, "Either use_plucker or use_dynamics_basis must be True"
+                
                 # append as extra channels
                 # 6 * H * W
-                plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
+                # plucker_tensor = motion_dynamics_basis.unsqueeze(-1).unsqueeze(-1).expand(-1, rgb_tensor.shape[1], rgb_tensor.shape[2])
 
             img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
             cam_images.append(self.transforms(img_chw))
@@ -776,6 +995,38 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
 
         return plucker_tensor
 
+    def _preprocess_images(self, images):
+        imgs_tensor = torch.stack(images, dim=0)
+        imgs_for_depth = F.interpolate(imgs_tensor, size=(224, 224), mode='bilinear', align_corners=False, antialias=True)
+        imgs_for_optical = imgs_for_depth.clamp_(0, 1).mul_(255.0)
+
+        return {
+            "tensor": imgs_tensor,
+            "for_depth": imgs_for_depth,
+            "for_optical": imgs_for_optical
+        }
+
+    def _get_optical_flow(self, cam_images, future_cam_images):
+        preprocessed_cam_imgs = self._preprocess_images(cam_images)
+        preprocessed_future_cam_imgs = self._preprocess_images(future_cam_images)
+
+        with torch.no_grad():
+            self.preprocess_model.eval()
+            optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
+            if self.use_depth_model:
+                depth1 = self.depth_backbone(img1_for_depth).unsqueeze(1)
+                depth2 = self.depth_backbone(img2_for_depth).unsqueeze(1)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+                # self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
+            elif self.use_depth_sim:
+                depth1 = torch.stack(depth_images, dim=0)
+                depth2 = torch.stack(future_depth_images, dim=0)
+                depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
+                optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
+
+
+
     def _get_motion_dynamics_basis(self, cam_to_world: np.ndarray):
         """
         cam_to_world: (4,4) camera pose matrix from pose_set (agentview).
@@ -870,7 +1121,8 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     self._set_camera_pose(cam_pose)
                 self.env.sim.forward()
                 motion_dynamics_basis = self._get_motion_dynamics_basis(cam_pose)  # (3,2)
-                robot_eef_pos = self.env._get_observations()['robot0_eef_pos']
+                sid = self.env.sim.model.site_name2id("gripper0_right_grip_site")
+                robot_eef_pos = self.env.sim.data.site_xpos[sid].copy()
                 rgb_tensor, depth_tensor = self._render_cur_scene(use_depth=self.use_depth_sim)
 
                 plucker_tensor = self._get_plucker_emb()
@@ -883,7 +1135,8 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                     self.env.step(dynamic_action)
 
                 self.env.sim.forward()
-                future_robot_eef_pos = self.env._get_observations()['robot0_eef_pos']
+                sid = self.env.sim.model.site_name2id("gripper0_right_grip_site")
+                future_robot_eef_pos = self.env.sim.data.site_xpos[sid].copy()
                 future_rgb_tensor, future_depth_tensor = self._render_cur_scene(use_depth=self.use_depth_sim)
                 future_img_chw = future_rgb_tensor \
                     if plucker_tensor is None \
@@ -925,7 +1178,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
         img2_for_depth=F.interpolate(future_image_tensor, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
         img1_224_for_optical = img1_for_depth.clamp_(0, 1).mul_(255.0)
         img2_224_for_optical = img2_for_depth.clamp_(0, 1).mul_(255.0)
-        
+
         with torch.no_grad():
             self.preprocess_model.eval()
             optical_flow = self.preprocess_model.extract_flow(img1_224_for_optical, img2_224_for_optical)
@@ -939,7 +1192,7 @@ class EpisodicImplicitExtrinsicDataset(Dataset):
                 depth1 = F.interpolate(depth1, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 depth2 = F.interpolate(depth2, size=(224,224), mode='bilinear', align_corners=False, antialias=True)
                 optical_flow = torch.cat([optical_flow, depth1, depth2], dim=1)
-            
+
             if self.args.debug:
                 self.preprocess_model.visualize_flow(img1_224_for_optical, img2_224_for_optical, optical_flow[:, :2])
                 for i in range(2):
