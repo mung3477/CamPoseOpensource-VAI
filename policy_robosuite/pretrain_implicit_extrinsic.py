@@ -214,8 +214,8 @@ def main(args, ckpt=None):
                         t_gt   = gt_extrinsic[:, :3, 3]
 
                         loss_t = F.smooth_l1_loss(t_pred, t_gt)
-                        loss_R = F.mse_loss(R_pred, R_gt)               # <- geodesic 대신 L2
-                        # loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
+                        # loss_R = F.mse_loss(R_pred, R_gt)               # <- geodesic 대신 L2
+                        loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
                         loss = loss_t + loss_R
                         with torch.no_grad():
                             rot_err_rad = geodesic_rot_loss(R_pred.float(), R_gt.float())
@@ -287,8 +287,8 @@ def main(args, ckpt=None):
                 t_gt   = gt_extrinsic[:, :3, 3]
 
                 loss_t = F.smooth_l1_loss(t_pred, t_gt)
-                loss_R = F.mse_loss(R_pred, R_gt)               # <- geodesic 대신 L2
-                # loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
+                # loss_R = F.mse_loss(R_pred, R_gt)               # <- geodesic 대신 L2
+                loss_R = geodesic_rot_loss(R_pred, R_gt)            # float32
                 loss = loss_t + loss_R
                 with torch.no_grad():
                     rot_err_rad = geodesic_rot_loss(R_pred.float(), R_gt.float())

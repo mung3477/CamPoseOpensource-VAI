@@ -189,7 +189,9 @@ def main(args, ckpt=None):
             with torch.inference_mode():
                 implicit_extrinsic_backbone.eval()
                 epoch_dicts = []
+                import pdb; pdb.set_trace()
                 for data in val_dataloader:
+                    import pdb; pdb.set_trace()
                     with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
                         optical_flow = data['optical_flow']
                         action = data['dynamic_actions_normalized']
